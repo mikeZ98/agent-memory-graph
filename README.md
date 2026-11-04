@@ -1,416 +1,617 @@
 # agent-memory-graph
 
-An asynchronous GraphRAG long-term memory engine for AI agents. It stores memories as
-a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts structured
-entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
-them over **FastAPI**.
+**Asynchronous GraphRAG long-term memory for AI agents.** Conversations go in; a typed
+knowledge graph comes out. Entities and directed relations are stored in **Neo4j**, entity
+embeddings in **Qdrant**. A question is answered by seeding from vector similarity and
+then walking the graph, so the agent gets facts that are *related* to what it asked, not
+just text that *looks like* it.
 
-> Status: deployable. Ingestion, GraphRAG retrieval, the FastAPI endpoints, guardrails
-> and telemetry work end to end, packaged as a hardened container with a Compose stack.
+| | |
+| --- | --- |
+| Runtime | Python 3.12, FastAPI, Pydantic v2, `neo4j` 6 async driver, `qdrant-client` 1.20, `instructor` |
+| API | `POST /v1/memory/ingest`, `POST /v1/memory/query`, `GET /health`, `GET /metrics`; every error is RFC 9457 `application/problem+json` |
+| Safety | Prompt-injection screening, Cypher-injection allowlist, circuit breakers, bounded queues, traversal containment, body limit |
+| Delivery | Digest-pinned, non-root (`10001:10001`), read-only container; hardened Compose stack; SHA-pinned CI with Trivy |
+| Quality | `mypy --strict`, strict ruff, 100 % line + branch coverage on every layer, Hypothesis fuzzing, `python -X dev` e2e harness |
 
-## Domain model
+## Contents
 
-`agent_memory_graph.domain` is pure (no I/O, no driver imports) and every model is
-immutable (`frozen=True`, `extra="forbid"`, tuples and read-only mappings all the way down).
-
-| Module      | Contracts                                                                 |
-| ----------- | ------------------------------------------------------------------------- |
-| `models.py` | `EntityType`, `Entity`, `Relation` triplets, `KnowledgeGraph`, `make_entity_id` |
-| `query.py`  | `MemoryQuery`, `GraphHop`, `GraphContext`                                 |
-| `errors.py` | `MemoryGraphError` hierarchy, `MemoryProblemDetails` (RFC 9457), `PROBLEM_TAXONOMY` |
-
-Invariants enforced at construction time:
-
-- **Entity ids** are lowercase slugs (`tool-neo4j`) or canonical UUIDs (lower-cased).
-  `make_entity_id(name, type)` derives them deterministically, with a UUIDv5 fallback for
-  names that have no ASCII slug.
-- **Names and text** are NFKC-normalised and stripped of invisible characters (controls,
-  zero-width and bidi-override code points). Multiline text keeps markdown indentation.
-- **Predicates** normalise to `SCREAMING_SNAKE_CASE` (`dependsOn` → `DEPENDS_ON`). They
-  become Neo4j relationship types, which Cypher cannot parameterise, so the allowlist is
-  also the injection boundary.
-- **`KnowledgeGraph`** rejects duplicate entity ids, dangling relation endpoints and
-  duplicate `(source, predicate, target)` triplets.
-- **Scalars are strict**: no `"0.5"` → `0.5` or `True` → `1`; weights, scores and
-  confidences are finite and in `[0, 1]`; `traversal_depth` is 1–3 and `top_k` 1–20.
-- **Errors** map one-to-one onto a problem `type` URI, `title` and HTTP status:
-
-  | Exception                     | `code`                         | Status |
-  | ----------------------------- | ------------------------------ | ------ |
-  | `MemoryGraphError`            | `AMG_INTERNAL_ERROR`           | 500    |
-  | `EntityIntegrityError`        | `AMG_ENTITY_INTEGRITY`         | 422    |
-  | `TraversalDepthExceededError` | `AMG_TRAVERSAL_DEPTH_EXCEEDED` | 422    |
-  | `VectorSearchTimeoutError`    | `AMG_VECTOR_SEARCH_TIMEOUT`    | 504    |
-  | `StoreUnavailableError`       | `AMG_STORE_UNAVAILABLE`        | 503    |
-  | `StoreTimeoutError`           | `AMG_STORE_TIMEOUT`            | 504    |
-  | `ExtractionFailedError`       | `AMG_EXTRACTION_FAILED`        | 502    |
-  | `ExtractionTimeoutError`      | `AMG_EXTRACTION_TIMEOUT`       | 504    |
-  | `InvalidInputError`           | `AMG_INVALID_INPUT`            | 422    |
-
-## Storage adapters
-
-`agent_memory_graph.adapters` holds the only code that talks to a database. Each adapter
-owns one async client for its lifetime (`async with Store.from_settings(settings) as s:`,
-or `connect()` / `close()`, both idempotent), and every driver failure leaves it as a
-`MemoryGraphError` subclass with the original exception chained as `__cause__`.
-
-**`Neo4jGraphStore`** (`neo4j.AsyncDriver`)
-
-- `ensure_schema()` creates a uniqueness constraint on `Entity.id`.
-- `ingest_graph(graph)` merges entities on `(id, type)` and relations on
-  `(source)-[PREDICATE]->(target)` in **one** write transaction, `UNWIND`-batched, so a
-  graph is either fully written or not at all. Nested `attributes` / `properties` are
-  stored as canonical JSON strings, since Neo4j properties cannot hold maps.
-- `traverse_neighborhood(seed_ids, depth=2)` follows relations outward for 1 to 3 hops and
-  returns each reached relation once, as an immutable `GraphHop` at its shortest depth.
-- Every value is a bound parameter. Relationship types and the `*1..N` bound cannot be
-  parameterised in Cypher, so both are re-validated (canonical predicate allowlist, int in
-  1..3) right before being spliced in. That check also blocks models built with
-  `model_construct()`, which skips validation.
-
-**`QdrantVectorStore`** (`qdrant_client.AsyncQdrantClient`, REST)
-
-- `ensure_collection()` creates a Cosine collection of `embedding_dim` plus a keyword
-  index on `entity_type`. It survives creation races and rejects an existing collection
-  whose vector configuration differs.
-- `upsert_entities(entities)` writes batched points with ids derived (UUIDv5) from entity
-  ids and an `{entity_id, name, entity_type}` payload. Entities without embeddings are
-  skipped, and dimensions are checked before anything is sent.
-- `search_seeds(vector, top_k, score_threshold, allowed_types)` returns entity ids, best
-  match first. Timeouts raise `VectorSearchTimeoutError`.
-- The client is built with `check_compatibility=False`: the default probe makes a network
-  call from a background thread at construction time.
-
-| Driver failure                                     | Domain error                          |
-| -------------------------------------------------- | ------------------------------------- |
-| Unreachable / session expired / transient / 502-503 | `StoreUnavailableError` (503)        |
-| Client deadline, server transaction timeout, 504   | `StoreTimeoutError` / `VectorSearchTimeoutError` (504) |
-| Neo4j uniqueness constraint violated / relation count mismatch | `EntityIntegrityError` (422) |
-| Rejected credentials / API key, anything else      | `MemoryGraphError` (500), no server message leaked |
-
-## Extraction and embedding services
-
-`agent_memory_graph.services` turns conversation text into memory. Both services depend
-on narrow ports, so the LLM and embedding providers are chosen where the app is
-assembled, not inside the library.
-
-**`GraphExtractor.extract_triplets(text) -> KnowledgeGraph`** (`extract()` also returns an
-`ExtractionReport` of what was pruned)
-
-1. *Guard.* The text is NFKC-normalised and stripped of control, zero-width and
-   bidi-override characters. Input over `max_input_chars` (32 000) raises `ValueError`
-   instead of being truncated, and empty input returns an empty graph without calling
-   the model. Look-alikes of the `<conversation>` delimiter are neutralised, and the
-   system prompt treats the text as data, never as instructions.
-2. *Extract.* A `StructuredLLM` returns a lenient `GraphExtraction` (entities by name,
-   relations by endpoint name). `InstructorStructuredLLM` wraps any
-   `instructor.AsyncInstructor`. instructor validates the tool call and re-asks the model
-   on schema or JSON errors; exhausting the retries raises `ExtractionFailedError`.
-3. *Convert.* Ids come from `make_entity_id(name, type)` and are never taken from the
-   model. Predicates are normalised to `SCREAMING_SNAKE_CASE` and unknown entity types
-   become `MISC`. Unprintable or oversized entities, invalid predicates, dangling
-   endpoints, self-loops and duplicate triplets are pruned and counted, and the
-   highest-confidence duplicate is kept. The result always satisfies `KnowledgeGraph`
-   integrity.
-
-```python
-import instructor
-from agent_memory_graph.services import GraphExtractor, InstructorStructuredLLM
-
-llm = InstructorStructuredLLM(
-    instructor.from_provider("<provider>/<model>", async_client=True), model="<model>"
-)
-graph = await GraphExtractor(llm).extract_triplets(conversation_text)
-```
-
-**`EmbeddingService`** (`dimension`, `embed_text`, `embed_entities`) embeds entities from
-`"<name> (<type>): <description>"`. `MockEmbeddingService(settings.embedding_dim)` is
-deterministic and dependency-free: signed feature hashing over word tokens, L2-normalised,
-so texts that share words get similar vectors and seed search behaves plausibly in
-hermetic tests.
-
-## GraphRAG memory service
-
-`GraphMemoryService` (`services/retrieval.py`) composes the stores, the extractor and
-the embedder behind two narrow ports (`GraphStore`, `VectorStore`).
-
-- **`ingest(text)`** extracts, then embeds (before anything is written), then writes
-  the graph in one Neo4j transaction, then upserts the vectors. Neo4j and Qdrant can't
-  share a transaction, so the graph is written first: a vector never points at a
-  missing node. If the upsert then fails, the graph is complete but those entities
-  aren't seedable yet. Every step is idempotent (deterministic ids, `MERGE`, upserts),
-  so retrying the same ingest converges. Nothing is rolled back across stores, because
-  a delete could destroy graph state that earlier conversations share.
-- **`query(MemoryQuery)`** embeds the text, takes the best `top_k` seeds above
-  `score_threshold` (optionally restricted to `entity_types`), traverses
-  `traversal_depth` hops outward, and resolves the seeds and every path endpoint in one
-  read. It returns a `GraphContext` whose `summary` is bounded, markdown-escaped
-  markdown and whose `confidence` is the best seed's cosine similarity. It returns
-  `GraphContext.empty()` when nothing clears the threshold.
-- **`health()`** pings both stores concurrently and reports, rather than raises, failures.
-
-## HTTP API
-
-`create_app(service_factory)` builds the FastAPI app. Its lifespan starts the service
-(connection pools plus idempotent schema/collection setup) and closes it on shutdown.
-`build_memory_service(settings, llm=..., embedder=...)` composes the production service
-and refuses an embedder whose dimension differs from `AMG_EMBEDDING_DIM`.
-
-| Endpoint                | Body              | Success                              |
-| ----------------------- | ----------------- | ------------------------------------ |
-| `POST /v1/memory/ingest` | `{"text": str}`   | `200 {"graph": KnowledgeGraph, "report": ExtractionReport}` |
-| `POST /v1/memory/query`  | `MemoryQuery`     | `200 GraphContext`                   |
-| `GET /health`            |                   | `200` `{"status": "ok", "checks": {...}}`, or `503` with `"degraded"` |
-| `GET /metrics`           |                   | `200` telemetry snapshot (JSON)      |
-
-Every error is `application/problem+json` (RFC 9457):
-
-- `MemoryGraphError` subclasses use their taxonomy entry, with `instance` defaulting to
-  the request path.
-- Request validation failures become `AMG_INVALID_INPUT` (422), listing each `loc`,
-  `msg` and `type` but never the rejected value.
-- Framework errors (404, 405, 413) use `type: about:blank`.
-- Anything unexpected becomes a generic `AMG_INTERNAL_ERROR` (500), and the exception is
-  logged, never returned.
-
-Bodies over 1 MiB are refused with 413 before parsing: by `Content-Length`, or while
-streaming when there is none.
-
-```python
-from agent_memory_graph.api import build_memory_service, create_app
-from agent_memory_graph.config import Settings
-
-settings = Settings()
-app = create_app(lambda: build_memory_service(settings, llm=my_llm, embedder=my_embedder))
-```
-
-## Guardrails
-
-`agent_memory_graph.guardrails` keeps one slow or hostile dependency from taking the
-service down. `build_memory_service` wires all of it from settings.
-
-| Guard | Behaviour |
-| ----- | --------- |
-| **Bounded queues** (`ConcurrencyLimiter`) | Each store allows at most `AMG_MAX_CONCURRENT_STORE_OPERATIONS` concurrent operations, and extraction allows `AMG_MAX_CONCURRENT_EXTRACTIONS`. A caller that can't get a permit within `AMG_QUEUE_TIMEOUT_SECONDS` gets `AMG_STORE_TIMEOUT` (`operation: "queue"`) or `AMG_EXTRACTION_TIMEOUT` (504) instead of piling up. |
-| **Circuit breakers** (`CircuitBreaker`) | A store's breaker opens after `AMG_BREAKER_FAILURE_THRESHOLD` consecutive *store* failures (unavailable or timed out; rejected requests don't count). While open, calls fail fast with 503 and `Retry-After` and never touch the store or the queue. After `AMG_BREAKER_RESET_SECONDS` one probe is let through; success closes the breaker, failure reopens it. Queue timeouts never trip a breaker, since they signal local overload, not store health. |
-| **Input guard** (`InputGuard`) | Text is screened before extraction. Forged structure (chat-template tokens such as `<\|im_start\|>`, `System:` role headers, fake `<conversation>`, `[INST]` and `<<SYS>>` delimiters) is defanged in place. Instruction-override phrasing is flagged but kept. `AMG_INPUT_GUARD_MODE=reject` refuses any finding with 422, without echoing the text. |
-| **Traversal guard** (`TraversalGuard`) | Traversal results are bounded before synthesis: at most 500 edges per seed, 100 out-edges per node (hubs) and 100 cycle-closing edges. Edges are kept shallowest and strongest first, and anything reachable only through a pruned edge is dropped, so every path stays connected to a seed. |
-| **Adaptive fallback** (`RetrievalPolicy`) | If the requested `score_threshold` finds no seeds, it's retried at ×0.8 per step, for up to `AMG_RETRIEVAL_FALLBACK_STEPS` extra searches and never below `AMG_RETRIEVAL_FALLBACK_FLOOR`. `confidence` then reflects the weaker match. |
-| **Telemetry** (`Telemetry`) | Request and failure counters, latency (count, sum, min, max, mean, p50/p95/p99, cumulative buckets), entities and relations indexed, pruned candidates and hops, suspicious inputs, fallbacks, and live queue occupancy and circuit states, served at `GET /metrics`. |
-
-## Verification
-
-**Property-based fuzzing** (`tests/unit/test_fuzzing.py`) checks these invariants:
-
-- `InputGuard` never raises in flag mode, and its output contains no chat-template
-  token, forged delimiter or role header. Re-scanning the output finds nothing, so
-  defanging is a fixed point. Reject mode raises exactly when something was found.
-- `make_entity_id` is deterministic, already canonical, padding- and (for ASCII)
-  case-insensitive, and namespaced by type.
-- Any LLM extraction payload becomes a `KnowledgeGraph` that holds integrity, or the
-  offending candidates are pruned.
-- `TraversalGuard` respects its degree, fan-out and cycle limits on random graphs,
-  1 500-leaf stars, rings and 20 000-hop chains. Every kept path stays anchored to a
-  seed, and the report adds up.
-- Fallback thresholds start at the requested value, decrease strictly, never go below
-  the floor, take at most `max_fallback_steps` steps, and stop early only at the floor.
-
-**End-to-end harness** (`tests/e2e/`): `tests.e2e.serve` runs the production ASGI app,
-service and guardrails under uvicorn with `python -X dev`, on a Unix socket in
-`.cache/e2e/`. Stores are in memory, and a deterministic rule-based model stands in for
-the LLM. The test probes `/health`, ingests a multi-turn conversation that includes a
-forged `System:` line, queries it, checks the markdown summary and the `/metrics`
-counters, then sends SIGTERM. It expects exit 0, the lifespan closing both stores, and
-no unawaited coroutines, `ResourceWarning`s or tracebacks on stderr. Uvicorn re-raises
-the shutdown signal after a graceful stop. The launcher installs the handler uvicorn
-restores, so a completed graceful shutdown exits 0 explicitly.
-
-## Running
-
-```bash
-python -m agent_memory_graph                     # 127.0.0.1:8000, AMG_* settings
-python -m agent_memory_graph --host 0.0.0.0 --port 8080
-python -m agent_memory_graph --uds .cache/run/amg.sock --factory pkg.module:make_app
-```
-
-The entrypoint runs uvicorn in-process. Settings are validated at startup (a bad
-configuration exits 3). SIGTERM or SIGINT drains in-flight requests, the lifespan
-closes the connection pools, and the process exits **0**. `AMG_LLM_MODEL` selects the
-extraction model in instructor's `provider/model` form (for example
-`anthropic/claude-opus-5-5`, installed with the `anthropic` extra). Credentials come
-from the provider's own variables, such as `ANTHROPIC_API_KEY`. Without
-`AMG_LLM_MODEL`, queries work and ingestion answers `AMG_EXTRACTION_FAILED`. The
-default app embeds with the lexical hashing embedder; plug a semantic
-`EmbeddingService` into `build_memory_service` for production-grade recall.
-
-## Container
-
-```bash
-export AMG_NEO4J_PASSWORD="$(openssl rand -base64 24)"
-export AMG_LLM_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=...   # optional
-docker compose up -d --wait          # API on 127.0.0.1:8000
-```
-
-**Image** (`Dockerfile`):
-
-- A multi-stage build. Every base image (`python:3.12.13-slim-trixie`, `uv:0.11.7`) is
-  pinned by digest. uv builds a frozen, non-editable, bytecode-compiled virtualenv in
-  `/opt/venv`.
-- The runtime is the same CPython with pip, `apt`/`dpkg` and their state removed and
-  every setuid/setgid bit stripped. It runs as `appuser` `10001:10001` and the venv is
-  root-owned, so it's immutable to the app.
-- It works with `--read-only`: only `/tmp` (tmpfs) is written, and
-  `PYTHONDONTWRITEBYTECODE=1` is set.
-- The exec-form `ENTRYPOINT ["python", "-m", "agent_memory_graph"]` has no shell
-  wrapper, so SIGTERM reaches PID 1 directly. `STOPSIGNAL SIGTERM` and an exec-form
-  Python `HEALTHCHECK` are set.
-- It carries OCI labels (SPDX `MIT`, source repository, version and revision build
-  args). Provider SDKs are opt-in: `--build-arg AMG_EXTRAS=anthropic`.
-
-**Stack** (`docker-compose.yml`):
-
-- The API runs `read_only`, with `cap_drop: [ALL]`, `no-new-privileges`, user
-  `10001:10001`, a `noexec,nosuid` tmpfs at `/tmp`, and pids and memory limits. It's
-  published on `127.0.0.1` only.
-- Neo4j 5.26 LTS and Qdrant 1.20 are pinned by tag and digest, with healthchecks
-  (a Bolt `RETURN 1` on 7687 and `GET /readyz`). They sit on an `internal` network with
-  no published ports. The API waits for both to be healthy.
-- `AMG_NEO4J_PASSWORD` is mandatory, and no secret is ever written into the file.
-
-**Smoke tests** (`scripts/smoke-docker.sh`):
-
-| Mode | Needs | Checks |
-| ---- | ----- | ------ |
-| `--offline` | nothing | `scripts/container_policy.py` (digest pins, final `USER 10001:10001`, appuser UID/GID, exec-form entrypoint without shell, setuid strip, package-manager and pip removal, HEALTHCHECK, STOPSIGNAL, OCI and SPDX labels, no baked secrets, Hadolint DL3000/2/4/6/7/15/20/25/42; a deny-by-default `.dockerignore`; Compose hardening, mandatory password, digest-pinned stores on an internal network, store healthchecks), `hadolint` when installed, and `docker compose config` |
-| default | + daemon | offline checks, then build the image and assert, inside a `--read-only --cap-drop ALL` container, uid 10001, no package managers or compilers, no setuid files, a read-only root and a writable `/tmp` |
-| `--live` | + daemon, image pulls | boot the whole stack, probe `/health`, SIGTERM the API and require exit code 0 plus a logged graceful shutdown |
-
-The offline mode runs in the test suite (`tests/unit/test_container_policy.py`), which
-also mutates the shipped files to prove that every rule fires.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests. Every job uses
-`ubuntu-24.04` and a timeout, the workflow token is read-only (`contents: read`), and
-checkouts never persist credentials. Every third-party action is pinned by its full
-40-character commit SHA, with the release tag as a comment. Each SHA was checked
-against its tag through the GitHub API when it was pinned. The Trivy binary itself is
-pinned too (`v0.76.1`). Caches stay under `./.cache/` exactly as locally.
-
-| Job | Gates |
-| --- | ----- |
-| `attribution-audit` | Full-history checkout, then `audit-attribution.sh` over the pushed or PR range and over the whole history, then `audit-hygiene.sh` |
-| `code-quality` (needs the audit) | `uv sync --locked` (Python 3.12, uv cache), workflow policy, `ruff check`, `ruff format --check`, `mypy`, `bandit`, `HYPOTHESIS_PROFILE=ci pytest` (including the e2e subprocess and container policy tests), `coverage-gate.sh`, `audit-cache-leaks.sh` |
-| `container-security` (needs the audit) | Buildx build of `agent-memory-graph:ci` (GHA layer cache), `smoke-docker.sh --live` on that exact image (hadolint from a pinned image, in-container hardening checks, Compose boot, `/health`, SIGTERM exit 0), then **Trivy**: fail closed on fixable `CRITICAL`/`HIGH` vulnerabilities and secrets (`--ignore-unfixed`, `exit-code: 1`), plus an informational report of unfixed findings |
-
-Run the same gates locally:
-
-```bash
-python scripts/audit-workflows.py && ruff check . && ruff format --check . && mypy \
-  && bandit -c pyproject.toml -r src && HYPOTHESIS_PROFILE=ci pytest \
-  && scripts/coverage-gate.sh && scripts/smoke-docker.sh --offline \
-  && scripts/audit-attribution.sh HEAD && scripts/audit-hygiene.sh && scripts/audit-cache-leaks.sh
-```
-
-## Configuration
-
-Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
-
-| Variable                       | Default                  | Notes                                  |
-| ------------------------------ | ------------------------ | -------------------------------------- |
-| `AMG_NEO4J_URI`                | `neo4j://localhost:7687` | `neo4j`, `bolt` (`+s`, `+ssc`); no credentials in the URI |
-| `AMG_NEO4J_USER`               | `neo4j`                  |                                        |
-| `AMG_NEO4J_PASSWORD`           | **required**             | secret                                 |
-| `AMG_NEO4J_DATABASE`           | server home database     |                                        |
-| `AMG_NEO4J_MAX_POOL_SIZE`      | `50`                     |                                        |
-| `AMG_QDRANT_URL`               | `http://localhost:6333`  | `http` / `https`                       |
-| `AMG_QDRANT_API_KEY`           | none                     | secret; requires `https` unless the host is loopback |
-| `AMG_QDRANT_COLLECTION`        | `amg_entities`           |                                        |
-| `AMG_QDRANT_UPSERT_BATCH_SIZE` | `256`                    |                                        |
-| `AMG_EMBEDDING_DIM`            | `384`                    | 1 to 8192                              |
-| `AMG_DEFAULT_TIMEOUT_SECONDS`  | `10.0`                   | per operation, client and server side  |
-| `AMG_MAX_CONCURRENT_EXTRACTIONS` | `4`                    | concurrent LLM extraction calls        |
-| `AMG_MAX_CONCURRENT_STORE_OPERATIONS` | `32`              | per store                              |
-| `AMG_QUEUE_TIMEOUT_SECONDS`    | `2.0`                    | max wait for a permit                  |
-| `AMG_BREAKER_FAILURE_THRESHOLD` | `5`                     | consecutive store failures to trip     |
-| `AMG_BREAKER_RESET_SECONDS`    | `30.0`                   | open time before a half-open probe     |
-| `AMG_INPUT_GUARD_MODE`         | `flag`                   | `flag` or `reject`                     |
-| `AMG_RETRIEVAL_FALLBACK_STEPS` | `3`                      | 0 disables the fallback                |
-| `AMG_RETRIEVAL_FALLBACK_FLOOR` | `0.1`                    | lowest threshold a fallback may use    |
-| `AMG_LLM_MODEL`                | unset                    | `provider/model` for instructor, e.g. `anthropic/claude-opus-5-5` |
-| `AMG_LLM_MAX_TOKENS`           | `16000`                  | per extraction call                    |
-| `AMG_HTTP_HOST` / `AMG_HTTP_PORT` | `127.0.0.1` / `8000`  | launcher defaults (the image binds `0.0.0.0`) |
-| `AMG_LOG_LEVEL`                | `info`                   | launcher log level                     |
-| `AMG_GRACEFUL_TIMEOUT_SECONDS` | `10`                     | drain time after SIGTERM               |
-
-Empty values (as Compose passes for unset `${VAR:-}`) mean *unset* for the optional
-`AMG_NEO4J_DATABASE`, `AMG_QDRANT_API_KEY` and `AMG_LLM_MODEL`.
+- [Quickstart](#quickstart)
+- [Architecture](#architecture)
+- [Protocol lifecycle](#protocol-lifecycle)
+- [API reference](#api-reference)
+- [RFC 9457 error taxonomy](#rfc-9457-error-taxonomy)
+- [Threat model (STRIDE)](#threat-model-stride)
+- [Domain model](#domain-model)
+- [Guardrails](#guardrails)
+- [Configuration](#configuration)
+- [Operations](#operations)
+- [Verification and quality gates](#verification-and-quality-gates)
+- [Repository layout](#repository-layout)
+- [Contributing](#contributing)
 
 ## Quickstart
 
-```bash
-direnv allow          # pins caches, venv and temp dirs under ./.cache/, wires git hooks
-uv sync               # creates .cache/venv with runtime + dev dependencies
+### Docker Compose (recommended)
 
-ruff check . && ruff format --check .
-mypy                  # strict mode, configured in pyproject.toml
-pytest                # hermetic: inet sockets blocked, no live services
-HYPOTHESIS_PROFILE=ci pytest -m fuzz   # deeper property fuzzing (200 examples)
-pytest -m e2e         # uvicorn subprocess over a Unix socket
-scripts/coverage-gate.sh   # domain 100 %; adapters, config, services, api, guardrails >= 95 %
-bandit -c pyproject.toml -r src
+```bash
+export AMG_NEO4J_PASSWORD="$(openssl rand -base64 24)"
+# Optional: the extraction model, in instructor's "provider/model" form.
+export AMG_LLM_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=sk-ant-...
+
+docker compose up -d --wait            # builds the image, waits for all healthchecks
+curl -s http://127.0.0.1:8000/health
+# {"status":"ok","checks":{"graph_store":"ok","vector_store":"ok"}}
 ```
 
-Without direnv, run `git config core.hooksPath .githooks` once and prefix the tool
-commands with `uv run`.
+Only the API is published, and only on `127.0.0.1:8000`. Neo4j and Qdrant run on an
+internal network with no host ports. Without `AMG_LLM_MODEL` the stack still boots and
+answers queries, but ingestion returns `502 AMG_EXTRACTION_FAILED`.
 
-## Quality gates
+### Local Python
 
-| Gate         | Tool / location                     | Enforces                                                        |
-| ------------ | ----------------------------------- | --------------------------------------------------------------- |
-| Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
-| Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
-| Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
-| Fuzzing      | `hypothesis` (`tests/unit/test_fuzzing.py`) | Property-based invariants; `dev` profile with 50 examples, `ci` with 200 (derandomised); state in `.cache/hypothesis/` |
-| End to end   | `tests/e2e/` (`python -X dev`, uvicorn) | Full HTTP scenario in a subprocess, clean SIGTERM/SIGINT exit 0, no dev-mode warnings |
-| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/`, `api/`, `guardrails/` (line + branch) |
-| Security     | `bandit`                            | Static security scan of `src/`                                  |
-| `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
-| `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
-| `pre-push`   | `.githooks/pre-push`                | Attribution audit of outgoing commits and a full-tree hygiene audit |
+```bash
+direnv allow                           # every cache, the venv and temp files go under ./.cache/
+uv sync --extra anthropic              # runtime + dev dependencies + the Anthropic SDK
 
-| Workflows    | `scripts/audit-workflows.py`        | YAML syntax, actions pinned by full commit SHA with version comments, read-only permissions, `ubuntu-24.04`, no script injection, CI gate wiring |
-| Cache leaks  | `scripts/audit-cache-leaks.sh`      | No caches, virtualenvs or build/test artifacts outside `./.cache/` |
+# Stores for development, bound to loopback only (same pinned images as the stack).
+docker run -d --name amg-neo4j -p 127.0.0.1:7687:7687 \
+  -e NEO4J_AUTH="neo4j/$AMG_NEO4J_PASSWORD" \
+  neo4j:5.26.27-community@sha256:937fbd163e302a5751dd329b719c1b05e2a4293af223d61b1aa17e3dea087709
+docker run -d --name amg-qdrant -p 127.0.0.1:6333:6333 \
+  qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
 
-All hook patterns are defined once in `.githooks/_policy.sh`. You can run the audits
-on demand with `scripts/audit-attribution.sh [<rev-list args>]` and
-`scripts/audit-hygiene.sh`.
+export AMG_NEO4J_PASSWORD AMG_LLM_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=sk-ant-...
+python -m agent_memory_graph            # http://127.0.0.1:8000 (see --help)
+```
+
+### Remember something, then ask about it
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/memory/ingest \
+  -H 'content-type: application/json' \
+  -d '{"text": "User: The Memory Service uses Neo4j for the graph and Qdrant for vectors.\nAssistant: And Neo4j runs on the JVM, right?\nUser: Yes. Ada Lovelace maintains the Memory Service."}'
+```
+
+```json
+{
+  "graph": {
+    "entities": [
+      {"id": "tool-memory-service", "name": "Memory Service", "entity_type": "TOOL",
+       "description": "", "attributes": {}, "embedding": null},
+      {"id": "tool-neo4j", "name": "Neo4j", "entity_type": "TOOL", "...": "..."}
+    ],
+    "relations": [
+      {"source_id": "tool-memory-service", "predicate": "USES", "target_id": "tool-neo4j",
+       "weight": 1.0, "properties": {}}
+    ]
+  },
+  "report": {"entities": 5, "relations": 4, "merged_entities": 0, "invalid_entities": 0,
+             "dangling_relations": 0, "invalid_predicates": 0, "self_loops": 0,
+             "duplicate_relations": 0, "dangling_names": []}
+}
+```
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/memory/query \
+  -H 'content-type: application/json' \
+  -d '{"text": "What does the Memory Service depend on?", "top_k": 3, "traversal_depth": 2}'
+```
+
+```json
+{
+  "seed_entities": [{"id": "tool-memory-service", "name": "Memory Service", "...": "..."}],
+  "paths": [
+    {"source_id": "tool-memory-service", "predicate": "USES", "target_id": "tool-neo4j", "weight": 1.0, "depth": 1},
+    {"source_id": "tool-memory-service", "predicate": "USES", "target_id": "tool-qdrant", "weight": 1.0, "depth": 1},
+    {"source_id": "tool-neo4j", "predicate": "RUNS_ON", "target_id": "tool-jvm", "weight": 1.0, "depth": 2}
+  ],
+  "summary": "## Relevant memories\n\n- **Memory Service** (tool)\n\n## Relationships\n\n- **Memory Service** USES **Neo4j** (weight 1.00, depth 1)\n- **Memory Service** USES **Qdrant** (weight 1.00, depth 1)\n- **Neo4j** RUNS_ON **JVM** (weight 1.00, depth 2)",
+  "confidence": 0.71
+}
+```
+
+The `summary` is ready to drop into a prompt. The JVM fact sits two hops from anything
+the question mentions, which is exactly what plain vector search misses (see
+[GraphRAG vs. classical vector search](#graphrag-vs-classical-vector-search)).
+
+```bash
+curl -s http://127.0.0.1:8000/metrics     # counters, latencies, queue occupancy, circuit states
+```
+
+## Architecture
+
+### System topology
+
+```mermaid
+flowchart LR
+    client(["Agent / client"])
+
+    subgraph api["FastAPI application · agent_memory_graph.api"]
+        direction TB
+        bodylimit["BodySizeLimitMiddleware<br/>413 above 1 MiB, before parsing"]
+        routes["Routes<br/>/v1/memory/ingest · /v1/memory/query<br/>/health · /metrics"]
+        problems["RFC 9457 handlers<br/>application/problem+json"]
+    end
+
+    orchestrator["GraphMemoryService<br/>orchestrator · services/retrieval.py"]
+
+    subgraph guardrails["Guardrails · agent_memory_graph.guardrails"]
+        direction TB
+        inputguard["InputGuard<br/>defang · flag · reject"]
+        traversalguard["TraversalGuard<br/>fan-out · hubs · cycles"]
+        llmlimit["GuardedLLM<br/>ConcurrencyLimiter"]
+        graphguard["GuardedGraphStore<br/>CircuitBreaker → queue"]
+        vectorguard["GuardedVectorStore<br/>CircuitBreaker → queue"]
+        telemetry["Telemetry<br/>GET /metrics"]
+    end
+
+    subgraph services["Services"]
+        direction TB
+        extractor["GraphExtractor<br/>instructor StructuredLLM"]
+        embedder["EmbeddingService<br/>embed_text · embed_entities"]
+    end
+
+    subgraph adapters["Storage adapters"]
+        direction TB
+        neo4jstore["Neo4jGraphStore<br/>UNWIND · MERGE · bound parameters<br/>variable-length traversal *1..N"]
+        qdrantstore["QdrantVectorStore<br/>Cosine · keyword index on entity_type<br/>UUIDv5 point ids"]
+    end
+
+    llm[("LLM provider")]
+    neo4j[("Neo4j 5.26 LTS")]
+    qdrant[("Qdrant 1.20")]
+
+    client --> bodylimit --> routes --> orchestrator
+    routes -. "MemoryGraphError" .-> problems
+    orchestrator --> inputguard --> extractor --> llmlimit --> llm
+    orchestrator --> embedder
+    orchestrator --> graphguard --> neo4jstore --> neo4j
+    orchestrator --> vectorguard --> qdrantstore --> qdrant
+    orchestrator --> traversalguard
+    orchestrator -. "counters · latency" .-> telemetry
+```
+
+Layering is strict and enforced by imports. `domain/` is pure: no I/O and no driver
+imports. `services/` depends on the domain and on narrow ports (`StructuredLLM`,
+`EmbeddingService`, `GraphStore`, `VectorStore`). `adapters/` are the only modules that
+talk to a database. `guardrails/` wraps the ports as decorators. `api/` and `server.py`
+are the composition root.
+
+### GraphRAG vs. classical vector search
+
+```mermaid
+flowchart TB
+    question["What does the Memory Service depend on?"]
+
+    subgraph classic["Classical vector search"]
+        direction TB
+        c1["embed question"] --> c2["top-k nearest chunks"] --> c3["prompt = similar text only"]
+    end
+
+    subgraph graphrag["GraphRAG (this engine)"]
+        direction TB
+        g1["embed question"] --> g2["seed entities in Qdrant<br/>score ≥ threshold, adaptive fallback"]
+        g2 --> g3["hop 1: Memory Service USES Neo4j, USES Qdrant"]
+        g3 --> g4["hop 2: Neo4j RUNS_ON JVM"]
+        g4 --> g5["TraversalGuard containment"]
+        g5 --> g6["GraphContext<br/>seeds + typed paths + markdown summary + confidence"]
+    end
+
+    question --> c1
+    question --> g1
+```
+
+Vector search returns things that look like the question. GraphRAG uses similarity
+only to find *entry points*, then follows typed, directed, weighted relations for up to
+`traversal_depth` hops (1 to 3, default 2). Each relation is returned once, at the shortest
+depth it was reached, so the context carries structure (who uses what, what runs on what)
+that no single similar chunk contains.
+
+## Protocol lifecycle
+
+### Ingestion
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant API as FastAPI
+    participant S as GraphMemoryService
+    participant IG as InputGuard
+    participant X as GraphExtractor
+    participant L as LLM via instructor
+    participant E as EmbeddingService
+    participant N as Neo4j
+    participant Q as Qdrant
+
+    C->>API: POST /v1/memory/ingest {"text": "..."}
+    API->>API: body under 1 MiB, IngestRequest schema (strict str)
+    API->>S: ingest(text)
+    S->>IG: check(text)
+    IG-->>S: defanged text, findings counted in telemetry
+    S->>X: extract(text)
+    X->>X: NFKC, strip invisible characters, at most 32 000 chars, neutralise delimiters
+    X->>L: create(GraphExtraction, max_retries=2) behind the extraction queue
+    loop on schema or JSON errors
+        L->>L: instructor re-asks with the validation error
+    end
+    L-->>X: GraphExtraction (lenient candidates)
+    X->>X: make_entity_id, SCREAMING_SNAKE_CASE predicates
+    X->>X: prune invalid, dangling, self-loop and duplicate candidates
+    X-->>S: KnowledgeGraph + ExtractionReport
+    S->>E: embed_entities(entities)
+    E-->>S: entities with unit vectors
+    Note over S: embeddings exist before anything is written
+    S->>N: one write transaction: UNWIND MERGE entities, MERGE relations per predicate
+    N-->>S: committed atomically (or rolled back entirely)
+    S->>Q: upsert points in batches (UUIDv5 ids, entity payload)
+    Q-->>S: ok
+    S-->>API: graph, report
+    API-->>C: 200 {"graph": ..., "report": ...}
+```
+
+Neo4j and Qdrant cannot share a transaction, so the graph is written first: a vector
+never points at a node that doesn't exist. If the upsert then fails, the graph is
+complete but those entities aren't seedable yet. Every step is idempotent (deterministic
+ids, `MERGE`, upserts), so retrying the same ingest converges.
+
+### Retrieval
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant API as FastAPI
+    participant S as GraphMemoryService
+    participant E as EmbeddingService
+    participant Q as Qdrant
+    participant N as Neo4j
+    participant TG as TraversalGuard
+
+    C->>API: POST /v1/memory/query (MemoryQuery)
+    API->>S: query(MemoryQuery)
+    S->>E: embed_text(text)
+    E-->>S: query vector
+    loop threshold t, then t x 0.8 per step, at most 3 retries, never below the floor
+        S->>Q: search_scored(vector, top_k, t, entity_types)
+        Q-->>S: (entity_id, cosine score) pairs, best first
+    end
+    alt no seed at any threshold
+        S-->>API: GraphContext.empty()
+    else seeds found
+        S->>N: traverse_neighborhood(seed_ids, depth 1 to 3)
+        N-->>S: hops at their shortest depth, LIMIT 1000
+        S->>TG: contain(seed_ids, hops)
+        TG-->>S: hops within fan-out, hub and cycle budgets
+        S->>N: fetch_entities(seeds and path endpoints) in one read
+        N-->>S: entities
+        S->>S: render_summary: escaped markdown, at most 32 768 chars
+        S-->>API: GraphContext(seeds, paths, summary, confidence)
+    end
+    API-->>C: 200 GraphContext
+```
+
+### Circuit breaker trip and recovery
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as GraphMemoryService
+    participant B as CircuitBreaker neo4j
+    participant P as ConcurrencyLimiter
+    participant N as Neo4j
+
+    Note over B: CLOSED
+    loop 5 consecutive store failures
+        S->>B: check(), then guard()
+        B->>P: acquire a permit (2 s queue deadline)
+        P->>N: Cypher call
+        N--xS: StoreUnavailableError or StoreTimeoutError
+    end
+    Note over B: OPEN for 30 s
+    S->>B: check()
+    B--xS: CircuitOpenError, 503 with Retry-After, no permit taken, no store call
+    Note over B: reset timeout elapsed, HALF_OPEN
+    S->>B: guard() admits exactly one probe
+    B->>N: probe call
+    alt probe succeeds
+        N-->>S: ok
+        Note over B: CLOSED, failure streak reset
+    else probe fails
+        N--xS: store failure
+        Note over B: OPEN again for a full 30 s
+    end
+```
+
+Only failures of the *store* count: unavailable, timed out, or vector-search timeout.
+Rejections of the *request* (integrity errors, invalid input) prove the store is
+answering and reset the streak. A queue-deadline rejection signals local overload and
+never trips a breaker. A call that started before the trip and fails afterwards doesn't
+extend the open window.
+
+## API reference
+
+All bodies are JSON. Unknown fields are rejected (`extra="forbid"`), scalars are strict
+(`"5"` is not an int, `true` is not a number), and bodies over 1 MiB get `413` before
+they are parsed.
+
+| Method & path | Request | Success | Errors |
+| ------------- | ------- | ------- | ------ |
+| `POST /v1/memory/ingest` | `{"text": str}`, 1 to 128 000 raw chars (32 000 after cleaning) | `200 {"graph": KnowledgeGraph, "report": ExtractionReport}` | 422, 502, 503, 504, 500 |
+| `POST /v1/memory/query` | `MemoryQuery` | `200 GraphContext` (`GraphContext.empty()` when nothing matches) | 422, 503, 504, 500 |
+| `GET /health` | | `200 {"status": "ok", "checks": {"graph_store": "ok", "vector_store": "ok"}}` | `503`, same shape, `"status": "degraded"` |
+| `GET /metrics` | | `200` telemetry snapshot | |
+| `GET /openapi.json` | | OpenAPI 3.1 document, problem responses included | |
+
+**`MemoryQuery`**
+
+| Field | Type | Default | Constraint |
+| ----- | ---- | ------- | ---------- |
+| `text` | string | required | 1 to 4096 printable chars after NFKC and invisible-character stripping |
+| `top_k` | int | `5` | 1 to 20 |
+| `score_threshold` | float | `0.0` | 0 to 1 (cosine); relaxed by the adaptive fallback when nothing matches |
+| `traversal_depth` | int | `2` | 1 to 3 hops |
+| `entity_types` | list of `EntityType` or `null` | `null` (all) | non-empty, deduplicated, canonical order |
+
+**`GraphContext`**: `seed_entities` (best match first), `paths` (`GraphHop`:
+`source_id`, `predicate`, `target_id`, `weight`, `depth`), `summary` (markdown, names
+escaped, at most 32 768 chars), and `confidence` (the best seed's cosine similarity in
+[0, 1]).
+
+**`GET /metrics`** returns `uptime_seconds`; `counters` (`ingest_requests`,
+`ingest_failures`, `query_requests`, `query_failures`, `entities_indexed`,
+`relations_indexed`, `candidates_pruned`, `suspicious_inputs`, `query_fallbacks`,
+`fallback_hits`, `empty_contexts`, `traversal_hops_pruned`); `latency.ingest` and
+`latency.query` (count, sum, min, max, mean, p50, p95, p99, cumulative buckets);
+`limiters` (capacity, in use, available, waiting, acquired, rejected); and `circuits`
+(state, consecutive failures, times opened, rejected).
+
+## RFC 9457 error taxonomy
+
+Every error is `application/problem+json`. Members:
+
+| Member | Meaning |
+| ------ | ------- |
+| `type` | Stable URN identifying the problem class; one per `code` |
+| `title` | Fixed human summary for the `type` (never varies between occurrences) |
+| `status` | HTTP status, fixed per `type` |
+| `detail` | Occurrence-specific explanation, never containing rejected values or server messages |
+| `instance` | The request path, unless the error names a more specific occurrence URI |
+| `code` | Extension: machine-readable `AMG_*` code |
+| `context` | Extension: JSON object of structured, non-sensitive facts (below) |
+
+`MemoryProblemDetails` refuses to construct a body whose `type`, `title` and `status`
+disagree with the taxonomy, so a code can never be reported with conflicting semantics.
+
+| `code` | `type` | `title` | Status | Raised by | `context` members |
+| ------ | ------ | ------- | ------ | --------- | ----------------- |
+| `AMG_INVALID_INPUT` | `urn:agent-memory-graph:problem:invalid-input` | The request input is invalid | 422 | Request validation, oversized conversation text, `InputGuard` in reject mode | `errors`: `[{"loc", "msg", "type"}]`, without the rejected input |
+| `AMG_ENTITY_INTEGRITY` | `urn:agent-memory-graph:problem:entity-integrity` | Knowledge graph integrity violated | 422 | Neo4j uniqueness constraint, relation count mismatch during ingest | `dangling_ids`, `duplicate_ids` |
+| `AMG_TRAVERSAL_DEPTH_EXCEEDED` | `urn:agent-memory-graph:problem:traversal-depth-exceeded` | Graph traversal depth exceeds the allowed maximum | 422 | Programmatic traversal deeper than 3 (the HTTP API rejects it earlier as invalid input) | `requested_depth`, `max_depth` |
+| `AMG_INTERNAL_ERROR` | `urn:agent-memory-graph:problem:internal-error` | Internal memory graph error | 500 | Unexpected exceptions (logged, never returned), rejected store credentials, stored data violating the contract | `{}`, or `store`, `operation`, plus `neo4j_code` / `http_status` / `collection` |
+| `AMG_EXTRACTION_FAILED` | `urn:agent-memory-graph:problem:extraction-failed` | The language model did not return a usable extraction | 502 | instructor retries exhausted, provider client error, no `AMG_LLM_MODEL` | `reason`, `attempts` |
+| `AMG_STORE_UNAVAILABLE` | `urn:agent-memory-graph:problem:store-unavailable` | A backing store is unavailable | 503 | Unreachable store, expired session, transient failure, HTTP 502/503, **open circuit** | `store`, `retry_after_seconds` (open circuit; also sent as the `Retry-After` header) |
+| `AMG_STORE_TIMEOUT` | `urn:agent-memory-graph:problem:store-timeout` | A backing store operation exceeded its deadline | 504 | Client deadline, Neo4j transaction timeout, **queue deadline** (`operation: "queue"`) | `store`, `operation`, `timeout_seconds` |
+| `AMG_VECTOR_SEARCH_TIMEOUT` | `urn:agent-memory-graph:problem:vector-search-timeout` | Vector search exceeded its deadline | 504 | Qdrant seed search past its deadline (client, httpx or HTTP 504) | `timeout_seconds`, `collection` |
+| `AMG_EXTRACTION_TIMEOUT` | `urn:agent-memory-graph:problem:extraction-timeout` | Knowledge extraction exceeded its deadline | 504 | Extraction deadline (60 s) or extraction queue deadline | `timeout_seconds` |
+
+Framework-level errors have no further semantics and use `type: "about:blank"`
+(RFC 9457 §4.2.1) with the HTTP reason phrase as `title`: `404 Not Found`,
+`405 Method Not Allowed` (the `Allow` header is kept), and `413 Content Too Large`.
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/memory/query -H 'content-type: application/json' \
+  -d '{"text": "x", "traversal_depth": 9}'
+```
+
+```json
+{
+  "type": "urn:agent-memory-graph:problem:invalid-input",
+  "title": "The request input is invalid",
+  "status": 422,
+  "detail": "The request does not match the API contract.",
+  "instance": "/v1/memory/query",
+  "code": "AMG_INVALID_INPUT",
+  "context": {"errors": [{"loc": ["body", "traversal_depth"],
+                          "msg": "Input should be less than or equal to 3",
+                          "type": "less_than_equal"}]}
+}
+```
+
+## Threat model (STRIDE)
+
+Assets: the memory graph (integrity), the agent's prompts that consume `GraphContext`
+(integrity against injection), store credentials (confidentiality), and service
+availability. Trust boundaries: the HTTP client (untrusted), conversation text and LLM
+output (untrusted data), and the stores (trusted, but treated as fallible).
+
+| STRIDE | Threat | Defence | Where | Proven by |
+| ------ | ------ | ------- | ----- | --------- |
+| **S**poofing | Conversation text forges an operator turn (`System:`, `<\|im_start\|>`, `[INST]`, `<<SYS>>`, a fake `</conversation>`) to impersonate the system or developer | `InputGuard` defangs structural markers in place (brackets become parentheses, role headers become `[System]:`) and flags overrides. The extraction prompt wraps the text in neutralised delimiters and declares it "data, not instructions" | `guardrails/graph_guard.py`, `services/extractor.py` | `test_guardrails.py`, fuzzed fixed point in `test_fuzzing.py` |
+| **T**ampering | Trojan Source / homoglyph text (bidi overrides, zero-width joiners, fullwidth letters) smuggles look-alike names or hides instructions | NFKC normalisation and removal of every Unicode `C*` code point in names, descriptions, queries and screened text. Ids are derived, never accepted from the model | `domain/_base.py`, `domain/models.py` | `test_schemas.py` (sanitisation), `test_fuzzing.py` (ids) |
+| **T**ampering | An LLM or forged payload writes dangling, duplicate or malformed graph data | Lenient candidate schema, then strict domain validation. Dangling, self-loop and duplicate relations are pruned and counted. `KnowledgeGraph` enforces referential integrity, and Neo4j writes are one transaction | `services/extractor.py`, `domain/models.py`, `adapters/neo4j.py` | `test_extractor.py`, `test_fuzzing.py` |
+| **R**epudiation | Abuse or degradation goes unnoticed | `Telemetry` counts every ingest and query (requests, failures, suspicious inputs, pruned candidates and hops, fallbacks, empty contexts) with latency distributions and live breaker and queue state at `GET /metrics`. 5xx problems are logged with the exception; injection findings are logged by kind | `guardrails/telemetry.py`, `api/problems.py` | `test_guardrails.py`, `test_api.py`, e2e |
+| **I**nformation disclosure | Error bodies echo secrets, payloads, server messages or stack traces | RFC 9457 bodies are built from the taxonomy. Validation errors list only `loc`, `msg` and `type` (never `input` or `ctx`). Unexpected exceptions become a generic 500. Driver messages are reduced to codes. Secrets are `SecretStr`, and a Qdrant key is refused over plaintext | `api/problems.py`, `domain/errors.py`, `config.py`, adapters | `test_api.py` (`sk-secret-value`, `hunter2` never returned), `test_config.py` |
+| **D**enial of service | Graph fan-out bombs: hubs, dense cycles, star topologies | Traversal bounded to 1 to 3 hops and `LIMIT 1000` with a server-side transaction timeout. `TraversalGuard` caps 500 edges per seed, 100 out-edges per node and 100 cycle edges, and drops orphans | `adapters/neo4j.py`, `guardrails/graph_guard.py` | `test_guardrails.py`, fuzzed on 1 500-leaf stars and 20 000-hop chains |
+| **D**enial of service | Request floods and slow dependencies exhaust workers or pools | Bounded queues per store and for extraction with a 2 s deadline (504 instead of pile-ups). Circuit breakers fail fast with `Retry-After`. Every store call has a client and server deadline | `guardrails/limiter.py`, `guardrails/stores.py` | `test_guardrails.py` (saturation, trip, half-open) |
+| **D**enial of service | Oversized or endless bodies, ReDoS | 1 MiB body limit (declared or streamed). Raw and cleaned text ceilings. Input-guard regexes use bounded single-class repetition and are linear on adversarial input | `api/middleware.py`, `guardrails/graph_guard.py` | `test_api.py` (413), `test_guardrails.py` (linear-time scan) |
+| **E**levation of privilege | Cypher injection through predicates or traversal depth, which Cypher cannot parameterise | Every value is a bound parameter. Relationship types are re-checked against the `[A-Z0-9_]` allowlist and backtick-quoted right before splicing, even for `model_construct` objects. Depth is spliced only as a validated int in 1 to 3 | `adapters/neo4j.py`, `domain/models.py` | `test_adapters.py` (`DETACH DELETE` payloads rejected before any session) |
+| **E**levation of privilege | Container escape or lateral movement after compromise | Non-root `10001:10001`, read-only root filesystem with a `noexec` tmpfs, `cap_drop: [ALL]`, `no-new-privileges`. No pip, apt, dpkg or setuid binaries in the image. Stores on an internal network without published ports | `Dockerfile`, `docker-compose.yml` | `scripts/container_policy.py`, `smoke-docker.sh` (in-container checks) |
+| **E**levation of privilege | Supply-chain tampering in CI or images | Images pinned by digest. Actions pinned by full commit SHA. Read-only workflow token, no persisted checkout credentials, no `pull_request_target`. Trivy fails closed on fixable CRITICAL/HIGH | `.github/workflows/ci.yml` | `scripts/audit-workflows.py`, `test_workflow_policy.py` |
+
+Residual risks:
+
+- `InputGuard` flags, but does not remove, natural-language overrides such as "ignore
+  previous instructions". The downstream prompt must still treat `GraphContext` as data.
+- Traversal fan-out is bounded after the database query, so a very dense graph costs
+  Neo4j work up to the query `LIMIT` and timeout.
+- The default embedder is lexical, not semantic (see [Operations](#operations)).
+
+## Domain model
+
+`agent_memory_graph.domain` is immutable all the way down: `frozen=True`,
+`extra="forbid"`, tuples and read-only mappings.
+
+- **`EntityType`**: `PERSON`, `ORGANIZATION`, `TOOL`, `CONCEPT`, `LOCATION`, `EVENT`,
+  `MISC`.
+- **`Entity`**: `id` (lowercase slug such as `tool-neo4j`, or a canonical UUID), `name`
+  (single line, NFKC, at most 256 chars), `entity_type`, `description` (at most 4096
+  chars, line structure kept), `attributes` (read-only JSON), and an optional
+  `embedding`. `make_entity_id(name, type)` is deterministic, case- and
+  padding-insensitive, and namespaced by type, falling back to UUIDv5 for names without
+  an ASCII slug.
+- **`Relation`**: `source_id`, `predicate` (`dependsOn` and `depends on` both become
+  `DEPENDS_ON`), `target_id`, `weight` in [0, 1], and `properties`.
+- **`KnowledgeGraph`** rejects duplicate ids, dangling endpoints and duplicate triplets.
+- **`MemoryQuery`**, **`GraphHop`** and **`GraphContext`**: see the
+  [API reference](#api-reference).
+
+## Guardrails
+
+| Guard | Default | Behaviour |
+| ----- | ------- | --------- |
+| `ConcurrencyLimiter` | 32 per store, 4 for extraction, 2 s queue deadline | `AMG_STORE_TIMEOUT` (`operation: "queue"`) or `AMG_EXTRACTION_TIMEOUT` instead of unbounded waiting |
+| `CircuitBreaker` | trips after 5 failures, resets after 30 s | Fail fast while open, then exactly one half-open probe; `CircuitOpenError` is a 503 with `Retry-After` |
+| `InputGuard` | `flag` | Structural forgeries are defanged and overrides counted; `reject` refuses with 422 |
+| `TraversalGuard` | 500 per seed, 100 per node, 100 cycle edges | Shallowest and strongest edges are kept; paths always stay anchored to a seed |
+| `RetrievalPolicy` | factor 0.8, floor 0.1, 3 steps | Strictly decreasing threshold schedule, never below the floor |
+| `BodySizeLimitMiddleware` | 1 MiB | 413 by `Content-Length`, or mid-stream when there is none |
+
+## Configuration
+
+Settings are read from `AMG_*` environment variables only; no `.env` file is ever loaded.
+Empty values, which Compose passes for unset `${VAR:-}`, mean *unset* for optional
+fields.
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `AMG_NEO4J_URI` | `neo4j://localhost:7687` | `neo4j` or `bolt`, optionally `+s` / `+ssc`; credentials in the URI are rejected |
+| `AMG_NEO4J_USER` | `neo4j` | |
+| `AMG_NEO4J_PASSWORD` | **required** | secret |
+| `AMG_NEO4J_DATABASE` | server home database | |
+| `AMG_NEO4J_MAX_POOL_SIZE` | `50` | |
+| `AMG_QDRANT_URL` | `http://localhost:6333` | `http` or `https` |
+| `AMG_QDRANT_API_KEY` | unset | secret; requires `https` unless the host is loopback |
+| `AMG_QDRANT_COLLECTION` | `amg_entities` | |
+| `AMG_QDRANT_UPSERT_BATCH_SIZE` | `256` | |
+| `AMG_EMBEDDING_DIM` | `384` | 1 to 8192; must match the embedder |
+| `AMG_DEFAULT_TIMEOUT_SECONDS` | `10.0` | per store operation, client and server side |
+| `AMG_LLM_MODEL` | unset | `provider/model` for `instructor.from_provider`, e.g. `anthropic/claude-opus-5-5` |
+| `AMG_LLM_MAX_TOKENS` | `16000` | per extraction call |
+| `AMG_MAX_CONCURRENT_EXTRACTIONS` | `4` | |
+| `AMG_MAX_CONCURRENT_STORE_OPERATIONS` | `32` | per store |
+| `AMG_QUEUE_TIMEOUT_SECONDS` | `2.0` | |
+| `AMG_BREAKER_FAILURE_THRESHOLD` | `5` | |
+| `AMG_BREAKER_RESET_SECONDS` | `30.0` | |
+| `AMG_INPUT_GUARD_MODE` | `flag` | `flag` or `reject` |
+| `AMG_RETRIEVAL_FALLBACK_STEPS` | `3` | `0` disables the fallback |
+| `AMG_RETRIEVAL_FALLBACK_FLOOR` | `0.1` | |
+| `AMG_HTTP_HOST` / `AMG_HTTP_PORT` | `127.0.0.1` / `8000` | launcher; the image binds `0.0.0.0` |
+| `AMG_LOG_LEVEL` | `info` | launcher |
+| `AMG_GRACEFUL_TIMEOUT_SECONDS` | `10` | drain time after SIGTERM |
+
+Provider credentials use the provider's own variables, for example `ANTHROPIC_API_KEY`.
+
+## Operations
+
+- **Process:** `python -m agent_memory_graph [--host --port | --uds PATH] [--factory module:callable]`.
+  - Settings are validated at startup; a bad configuration exits with code 3.
+  - SIGTERM or SIGINT drains in-flight requests, the lifespan closes both connection
+    pools, and the process exits **0**. Uvicorn re-raises the signal by default; the
+    launcher turns a completed graceful shutdown into an explicit success.
+- **Startup:** the lifespan connects both stores and creates the `Entity.id` uniqueness
+  constraint and the Cosine collection with its `entity_type` index, idempotently. A
+  failed start leaks no pool.
+- **Health:** `GET /health` pings both stores concurrently through their breakers. It
+  returns 200 when both answer and 503 `degraded` otherwise, and suits readiness probes.
+  The image and Compose healthchecks use it.
+- **Embeddings:** the default app uses `MockEmbeddingService`, deterministic signed
+  feature hashing over word tokens, and logs a warning saying so. It is lexical:
+  synonyms without shared words won't match. For production recall, pass a semantic
+  `EmbeddingService` to `build_memory_service` with the same `AMG_EMBEDDING_DIM`.
+- **Upgrades:**
+  - Base images are pinned by tag *and* digest in `Dockerfile` and
+    `docker-compose.yml`; bump both together.
+  - Changing `ENTITY_NAMESPACE` or the id scheme would re-key every UUIDv5 id.
+  - Changing `AMG_EMBEDDING_DIM` needs a new collection, because `ensure_collection`
+    refuses a mismatched one.
+
+### Container
+
+| Property | Value |
+| -------- | ----- |
+| Base | `python:3.12.13-slim-trixie` by digest; builder uses `uv:0.11.7` by digest |
+| User | `appuser` `10001:10001`; the venv is root-owned and immutable |
+| Filesystem | `--read-only`; only `/tmp` (tmpfs, `noexec,nosuid,nodev`) is written; bytecode precompiled |
+| Removed | pip, `apt`, `dpkg` and their state, setuid/setgid bits, docs |
+| Entrypoint | `["python", "-m", "agent_memory_graph"]`, exec form, PID 1 receives SIGTERM |
+| Health | exec-form Python `HEALTHCHECK` on `/health`; `STOPSIGNAL SIGTERM` |
+| Labels | OCI (`licenses=MIT`, `source`, `version`, `revision`, ...) |
+| Extras | provider SDKs opt-in: `--build-arg AMG_EXTRAS=anthropic` (Compose default) |
+
+`scripts/smoke-docker.sh` checks the container in three modes:
+
+- **`--offline`:** policy, hadolint and Compose config checks; no daemon needed.
+- **Default:** adds an image build and in-container checks.
+- **`--live`:** also boots the stack, probes `/health` and requires exit 0 after SIGTERM.
+
+## Verification and quality gates
+
+| Gate | Tool | Enforces |
+| ---- | ---- | -------- |
+| Lint and format | `ruff` (line length 100, broad strict rule set) | Annotations, docstrings, security (`S`), async, pathlib, ... |
+| Types | `mypy --strict` + pydantic plugin | `src/`, `tests/`, `scripts/` |
+| Tests | `pytest`, `pytest-asyncio`, `pytest-socket` | Inet sockets blocked; warnings are errors |
+| Fuzzing | Hypothesis (`dev` 50 / `ci` 200 examples) | Defanging fixed point, id determinism, graph integrity, containment limits, fallback convergence |
+| End to end | `python -X dev -m agent_memory_graph` over a Unix socket | Full HTTP scenario, no unawaited coroutines or `ResourceWarning`s, SIGTERM and SIGINT exit 0 |
+| Coverage | `scripts/coverage-gate.sh` | 100 % on `domain/`; at least 95 % on adapters, config, services, api, guardrails and the entrypoint (all currently 100 %) |
+| Security | `bandit` | `src/` |
+| Containers | `scripts/container_policy.py`, `scripts/smoke-docker.sh` | Dockerfile, `.dockerignore`, Compose hardening |
+| Workflows | `scripts/audit-workflows.py` | SHA pins, least privilege, runner pin, no script injection, gate wiring |
+| Documentation | `tests/unit/test_docs.py` | Taxonomy, settings and routes match the code; Mermaid and markdown structure |
+| Hygiene | `scripts/audit-attribution.sh`, `audit-hygiene.sh`, `audit-cache-leaks.sh` | Sole committer, Conventional Commits, no machine paths or secrets, no caches outside `./.cache/` |
+
+```bash
+ruff check . && ruff format --check . && mypy && bandit -c pyproject.toml -r src
+HYPOTHESIS_PROFILE=ci pytest && scripts/coverage-gate.sh
+scripts/smoke-docker.sh --offline && python scripts/audit-workflows.py
+scripts/audit-attribution.sh HEAD && scripts/audit-hygiene.sh && scripts/audit-cache-leaks.sh
+```
+
+CI (`.github/workflows/ci.yml`, `ubuntu-24.04`, `contents: read`, SHA-pinned actions) runs
+three jobs:
+
+- **`attribution-audit`:** commit identity and messages, plus tracked-file hygiene.
+- **`code-quality`:** every gate above with `HYPOTHESIS_PROFILE=ci`.
+- **`container-security`:** a Buildx image, `smoke-docker.sh --live`, and Trivy, which
+  fails closed on fixable CRITICAL/HIGH vulnerabilities and secrets.
 
 ## Repository layout
 
 ```text
-src/agent_memory_graph/   package (typed: ships py.typed)
-  domain/                 pure schemas, retrieval contracts, error taxonomy
-  adapters/               async Neo4j graph store and Qdrant vector store
-  services/               extraction (instructor), embeddings, GraphRAG retrieval
-  api/                    FastAPI app, endpoints, RFC 9457 handlers, body limit
-  guardrails/             limiters, circuit breakers, input/traversal guards, telemetry
-  config.py               AMG_* settings
-  server.py, __main__.py  process entrypoint (python -m agent_memory_graph)
-tests/                    hermetic test suite (conftest scrubs service credentials)
-  unit/                   unit, API and property-based tests
-  e2e/                    uvicorn subprocess harness (python -X dev, Unix socket)
-.githooks/                git hooks + shared policy
-scripts/                  audits (attribution, hygiene, workflows, cache leaks), coverage gate,
-                          container policy + smoke tests
-.github/workflows/ci.yml  CI: attribution audit, quality gates, container build, Trivy
-Dockerfile, .dockerignore, docker-compose.yml   hardened image and stack
-.envrc                    direnv: cache isolation under ./.cache/ and git wiring
+src/agent_memory_graph/
+  domain/        immutable schemas, retrieval contracts, RFC 9457 taxonomy (pure)
+  adapters/      Neo4jGraphStore, QdrantVectorStore (the only database code)
+  services/      GraphExtractor (instructor), EmbeddingService, GraphMemoryService
+  guardrails/    limiters, circuit breakers, input/traversal guards, telemetry, guarded ports
+  api/           FastAPI app, routes, problem handlers, body-size middleware
+  config.py      AMG_* settings
+  server.py      process entrypoint (python -m agent_memory_graph)
+tests/
+  unit/          unit, API, fuzzing, policy and documentation tests
+  e2e/           uvicorn subprocess harness (python -X dev, Unix socket)
+scripts/         audits, coverage gate, container and workflow policy, smoke tests
+.githooks/       pre-commit, commit-msg and pre-push hooks with shared policy
+Dockerfile, .dockerignore, docker-compose.yml, .github/workflows/ci.yml
 ```
 
 ## Contributing
 
-This repository has a single committer. Commits must be authored and committed as
-`mikeZ98 <145975972+mikeZ98@users.noreply.github.com>` and use
-[Conventional Commits](https://www.conventionalcommits.org/) subjects. The hooks reject
-anything else.
+This repository has a single committer: every commit is authored and committed as
+`mikeZ98 <145975972+mikeZ98@users.noreply.github.com>` with a
+[Conventional Commits](https://www.conventionalcommits.org/) subject and no
+tool-generated trailers. The local hooks (`git config core.hooksPath .githooks`, done by
+`direnv allow`) and CI reject anything else. Keep every cache under `./.cache/`.
+
+Licensed under the [MIT License](LICENSE).
