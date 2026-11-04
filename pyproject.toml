@@ -70,7 +70,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106", "PLR2004", "ARG001", "ARG002", "FBT", "D", "SLF001"]
+"tests/**" = [
+  "S101", "S105", "S106", "PLR2004", "ARG001", "ARG002", "FBT", "D", "SLF001", "ANN401",
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["agent_memory_graph"]
