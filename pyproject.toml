@@ -1,0 +1,141 @@
+[project]
+name = "agent-memory-graph"
+version = "0.1.0"
+description = "Asynchronous GraphRAG long-term memory engine for AI agents, backed by Neo4j and Qdrant."
+authors = [{ name = "mikeZ98", email = "145975972+mikeZ98@users.noreply.github.com" }]
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: AsyncIO",
+  "Framework :: FastAPI",
+  "Framework :: Pydantic :: 2",
+  "Typing :: Typed",
+]
+dependencies = [
+  "neo4j>=5.18.0",
+  "qdrant-client>=1.9.0",
+  "pydantic>=2.7.0",
+  "fastapi>=0.111.0",
+  "instructor>=1.2.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "pytest-socket>=0.7",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "bandit[toml]>=1.7.9",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_memory_graph"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+cache-dir = ".cache/ruff"
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "S", "SIM", "PT", "RET",
+  "ARG", "PTH", "PL", "RUF", "ASYNC", "TRY", "PERF", "FBT", "T20", "BLE", "ERA",
+  "ANN", "D", "DTZ", "EM", "G", "ISC", "PIE", "PYI", "Q", "RSE", "SLF", "TCH", "TID",
+]
+ignore = [
+  "PLR0913", # constructor-heavy adapters (drivers, clients) are expected
+  "TRY003",  # explicit messages on domain exceptions are preferred
+  "EM101",   # paired with TRY003
+  "D105",    # magic methods are self-describing
+  "D107",    # __init__ documented on the class
+  "D203",    # conflicts with D211
+  "D213",    # conflicts with D212
+  "ISC001",  # conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLR2004", "ARG001", "ARG002", "FBT", "D", "SLF001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent_memory_graph"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# Mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+cache_dir = ".cache/mypy"
+mypy_path = "src"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# ---------------------------------------------------------------------------
+# Pytest / coverage (hermetic: sockets disabled, no live Neo4j / Qdrant / LLM)
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+cache_dir = ".cache/pytest"
+markers = [
+  "integration: requires live Neo4j / Qdrant services (opt-in, sockets re-enabled)",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  "--disable-socket",
+  "--allow-unix-socket",
+  "--cov=agent_memory_graph",
+  "--cov-branch",
+  "--cov-report=term-missing",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["agent_memory_graph"]
+data_file = ".cache/coverage/.coverage"
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
+
+# ---------------------------------------------------------------------------
+# Bandit
+# ---------------------------------------------------------------------------
+[tool.bandit]
+targets = ["src"]
+exclude_dirs = ["tests", ".cache"]
