@@ -26,6 +26,7 @@ from pydantic import (
 )
 
 __all__ = [
+    "EMPTY_JSON_MAPPING",
     "MAX_JSON_NESTING",
     "FrozenJsonMapping",
     "Probability",
@@ -171,9 +172,18 @@ FrozenJsonMapping = Annotated[
     Mapping[str, Any],
     AfterValidator(freeze_json_mapping),
     PlainSerializer(thaw_json, return_type=dict[str, Any]),
-    Field(default_factory=lambda: MappingProxyType({})),
 ]
-"""Read-only, JSON-only ``Mapping[str, Any]`` that serialises back to a plain dict."""
+"""Read-only, JSON-only ``Mapping[str, Any]`` that serialises back to a plain dict.
+
+Give fields a default with ``Field(default_factory=EMPTY_JSON_MAPPING)`` on the field
+itself; a default inside the alias is invisible to the pydantic mypy plugin.
+"""
+
+
+def EMPTY_JSON_MAPPING() -> Mapping[str, Any]:  # noqa: N802 - reads as a constant at call sites
+    """Return a fresh empty read-only mapping (default factory for payload fields)."""
+    return MappingProxyType({})
+
 
 Probability = Annotated[float, Strict(), Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 """A finite float in ``[0.0, 1.0]``; ints are accepted, strings and bools are not."""

@@ -11,6 +11,8 @@ from agent_memory_graph.domain.errors import (
     ErrorCode,
     MemoryGraphError,
     MemoryProblemDetails,
+    StoreTimeoutError,
+    StoreUnavailableError,
     TraversalDepthExceededError,
     VectorSearchTimeoutError,
 )
@@ -37,6 +39,8 @@ __all__ = [
     "MemoryProblemDetails",
     "MemoryQuery",
     "Relation",
+    "StoreTimeoutError",
+    "StoreUnavailableError",
     "TraversalDepthExceededError",
     "VectorSearchTimeoutError",
     "make_entity_id",

@@ -23,6 +23,8 @@ from agent_memory_graph.domain import (
     MemoryProblemDetails,
     MemoryQuery,
     Relation,
+    StoreTimeoutError,
+    StoreUnavailableError,
     TraversalDepthExceededError,
     VectorSearchTimeoutError,
     make_entity_id,
@@ -677,9 +679,42 @@ class TestDomainErrors:
         problem = error.to_problem()
         assert (problem.detail, problem.context) == (detail, context)
 
+    def test_store_unavailable_error(self) -> None:
+        error = StoreUnavailableError("neo4j")
+        assert (error.store, error.status) == ("neo4j", 503)
+        problem = error.to_problem()
+        assert (problem.detail, problem.context) == (
+            "The neo4j store is unavailable.",
+            {"store": "neo4j"},
+        )
+
+    def test_store_timeout_error(self) -> None:
+        error = StoreTimeoutError("qdrant", "upsert_entities", 1.5)
+        assert (error.store, error.operation, error.timeout_seconds) == (
+            "qdrant",
+            "upsert_entities",
+            1.5,
+        )
+        problem = error.to_problem()
+        assert problem.status == 504
+        assert (
+            problem.detail == "The qdrant upsert_entities operation did not complete within 1.5s."
+        )
+        assert problem.context == {
+            "store": "qdrant",
+            "operation": "upsert_entities",
+            "timeout_seconds": 1.5,
+        }
+
     @pytest.mark.parametrize(
         "error_type",
-        [EntityIntegrityError, TraversalDepthExceededError, VectorSearchTimeoutError],
+        [
+            EntityIntegrityError,
+            TraversalDepthExceededError,
+            VectorSearchTimeoutError,
+            StoreUnavailableError,
+            StoreTimeoutError,
+        ],
     )
     def test_each_error_has_its_own_code(self, error_type: type[MemoryGraphError]) -> None:
         assert error_type.code is not MemoryGraphError.code

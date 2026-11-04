@@ -11,6 +11,7 @@ from pydantic import AfterValidator, Field, Strict, model_validator
 from pydantic_core import PydanticCustomError
 
 from agent_memory_graph.domain._base import (
+    EMPTY_JSON_MAPPING,
     FrozenJsonMapping,
     Probability,
     StrictModel,
@@ -32,6 +33,7 @@ __all__ = [
     "KnowledgeGraph",
     "Predicate",
     "Relation",
+    "is_canonical_predicate",
     "make_entity_id",
 ]
 
@@ -124,6 +126,19 @@ Embedding = Annotated[
 ]
 
 
+def is_canonical_predicate(value: object) -> bool:
+    """Return whether ``value`` is already a valid relationship type (no normalisation).
+
+    Adapters call this immediately before splicing a predicate into a statement, so a
+    model built with ``model_construct`` (which skips validation) cannot smuggle one in.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_PREDICATE_LENGTH
+        and _PREDICATE_RE.fullmatch(value) is not None
+    )
+
+
 def make_entity_id(name: str, entity_type: EntityType) -> str:
     """Derive the deterministic id of an entity from its type and (sanitised) name.
 
@@ -150,7 +165,7 @@ class Entity(StrictModel):
     name: EntityName
     entity_type: EntityType
     description: Description = ""
-    attributes: FrozenJsonMapping
+    attributes: FrozenJsonMapping = Field(default_factory=EMPTY_JSON_MAPPING)
     embedding: Embedding | None = None
 
 
@@ -161,7 +176,7 @@ class Relation(StrictModel):
     predicate: Predicate
     target_id: EntityId
     weight: Probability = 1.0
-    properties: FrozenJsonMapping
+    properties: FrozenJsonMapping = Field(default_factory=EMPTY_JSON_MAPPING)
 
     @property
     def key(self) -> tuple[str, str, str]:

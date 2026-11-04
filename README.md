@@ -5,8 +5,8 @@ a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts 
 entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
 them over **FastAPI**.
 
-> Status: domain layer. Schemas, retrieval contracts and the error taxonomy exist;
-> storage adapters and the API come next.
+> Status: storage layer. Domain contracts, configuration and the async Neo4j / Qdrant
+> adapters exist; the retrieval service and the API come next.
 
 ## Domain model
 
@@ -41,6 +41,67 @@ Invariants enforced at construction time:
   | `EntityIntegrityError`        | `AMG_ENTITY_INTEGRITY`         | 422    |
   | `TraversalDepthExceededError` | `AMG_TRAVERSAL_DEPTH_EXCEEDED` | 422    |
   | `VectorSearchTimeoutError`    | `AMG_VECTOR_SEARCH_TIMEOUT`    | 504    |
+  | `StoreUnavailableError`       | `AMG_STORE_UNAVAILABLE`        | 503    |
+  | `StoreTimeoutError`           | `AMG_STORE_TIMEOUT`            | 504    |
+
+## Storage adapters
+
+`agent_memory_graph.adapters` holds the only code that talks to a database. Each adapter
+owns one async client for its lifetime (`async with Store.from_settings(settings) as s:`,
+or `connect()` / `close()`, both idempotent), and every driver failure leaves it as a
+`MemoryGraphError` subclass with the original exception chained as `__cause__`.
+
+**`Neo4jGraphStore`** (`neo4j.AsyncDriver`)
+
+- `ensure_schema()` creates a uniqueness constraint on `Entity.id`.
+- `ingest_graph(graph)` merges entities on `(id, type)` and relations on
+  `(source)-[PREDICATE]->(target)` in **one** write transaction, `UNWIND`-batched, so a
+  graph is either fully written or not at all. Nested `attributes` / `properties` are
+  stored as canonical JSON strings, since Neo4j properties cannot hold maps.
+- `traverse_neighborhood(seed_ids, depth=2)` follows relations outward for 1 to 3 hops and
+  returns each reached relation once, as an immutable `GraphHop` at its shortest depth.
+- Every value is a bound parameter. Relationship types and the `*1..N` bound cannot be
+  parameterised in Cypher, so both are re-validated (canonical predicate allowlist, int in
+  1..3) right before being spliced in. That check also blocks models built with
+  `model_construct()`, which skips validation.
+
+**`QdrantVectorStore`** (`qdrant_client.AsyncQdrantClient`, REST)
+
+- `ensure_collection()` creates a Cosine collection of `embedding_dim` plus a keyword
+  index on `entity_type`. It survives creation races and rejects an existing collection
+  whose vector configuration differs.
+- `upsert_entities(entities)` writes batched points with ids derived (UUIDv5) from entity
+  ids and an `{entity_id, name, entity_type}` payload. Entities without embeddings are
+  skipped, and dimensions are checked before anything is sent.
+- `search_seeds(vector, top_k, score_threshold, allowed_types)` returns entity ids, best
+  match first. Timeouts raise `VectorSearchTimeoutError`.
+- The client is built with `check_compatibility=False`: the default probe makes a network
+  call from a background thread at construction time.
+
+| Driver failure                                     | Domain error                          |
+| -------------------------------------------------- | ------------------------------------- |
+| Unreachable / session expired / transient / 502-503 | `StoreUnavailableError` (503)        |
+| Client deadline, server transaction timeout, 504   | `StoreTimeoutError` / `VectorSearchTimeoutError` (504) |
+| Neo4j uniqueness constraint violated / relation count mismatch | `EntityIntegrityError` (422) |
+| Rejected credentials / API key, anything else      | `MemoryGraphError` (500), no server message leaked |
+
+## Configuration
+
+Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
+
+| Variable                       | Default                  | Notes                                  |
+| ------------------------------ | ------------------------ | -------------------------------------- |
+| `AMG_NEO4J_URI`                | `neo4j://localhost:7687` | `neo4j`, `bolt` (`+s`, `+ssc`); no credentials in the URI |
+| `AMG_NEO4J_USER`               | `neo4j`                  |                                        |
+| `AMG_NEO4J_PASSWORD`           | **required**             | secret                                 |
+| `AMG_NEO4J_DATABASE`           | server home database     |                                        |
+| `AMG_NEO4J_MAX_POOL_SIZE`      | `50`                     |                                        |
+| `AMG_QDRANT_URL`               | `http://localhost:6333`  | `http` / `https`                       |
+| `AMG_QDRANT_API_KEY`           | none                     | secret; requires `https` unless the host is loopback |
+| `AMG_QDRANT_COLLECTION`        | `amg_entities`           |                                        |
+| `AMG_QDRANT_UPSERT_BATCH_SIZE` | `256`                    |                                        |
+| `AMG_EMBEDDING_DIM`            | `384`                    | 1 to 8192                              |
+| `AMG_DEFAULT_TIMEOUT_SECONDS`  | `10.0`                   | per operation, client and server side  |
 
 ## Quickstart
 
@@ -51,7 +112,7 @@ uv sync               # creates .cache/venv with runtime + dev dependencies
 ruff check . && ruff format --check .
 mypy                  # strict mode, configured in pyproject.toml
 pytest                # hermetic: inet sockets blocked, no live services
-scripts/coverage-gate.sh   # 100 % line + branch coverage on the domain layer
+scripts/coverage-gate.sh   # domain 100 %, adapters + config >= 95 % (line + branch)
 bandit -c pyproject.toml -r src
 ```
 
@@ -65,7 +126,7 @@ commands with `uv run`.
 | Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
 | Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
 | Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
-| Domain cov.  | `scripts/coverage-gate.sh`          | 100 % line + branch coverage on `src/agent_memory_graph/domain/` |
+| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/` + `config.py` (line + branch) |
 | Security     | `bandit`                            | Static security scan of `src/`                                  |
 | `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
 | `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
@@ -80,9 +141,11 @@ on demand with `scripts/audit-attribution.sh [<rev-list args>]` and
 ```text
 src/agent_memory_graph/   package (typed: ships py.typed)
   domain/                 pure schemas, retrieval contracts, error taxonomy
+  adapters/               async Neo4j graph store and Qdrant vector store
+  config.py               AMG_* settings
 tests/                    hermetic test suite (conftest scrubs service credentials)
 .githooks/                git hooks + shared policy
-scripts/                  audits used by the hooks, domain coverage gate
+scripts/                  audits used by the hooks, per-layer coverage gate
 .envrc                    direnv: cache isolation under ./.cache/ and git wiring
 ```
 

@@ -14,7 +14,7 @@ from typing import Annotated, Any, ClassVar, Final, Self
 
 from pydantic import Field, Strict, model_validator
 
-from agent_memory_graph.domain._base import FrozenJsonMapping, StrictModel
+from agent_memory_graph.domain._base import EMPTY_JSON_MAPPING, FrozenJsonMapping, StrictModel
 
 __all__ = [
     "PROBLEM_JSON_MEDIA_TYPE",
@@ -24,6 +24,8 @@ __all__ = [
     "MemoryGraphError",
     "MemoryProblemDetails",
     "ProblemSpec",
+    "StoreTimeoutError",
+    "StoreUnavailableError",
     "TraversalDepthExceededError",
     "VectorSearchTimeoutError",
 ]
@@ -42,6 +44,8 @@ class ErrorCode(StrEnum):
     ENTITY_INTEGRITY = "AMG_ENTITY_INTEGRITY"
     TRAVERSAL_DEPTH_EXCEEDED = "AMG_TRAVERSAL_DEPTH_EXCEEDED"
     VECTOR_SEARCH_TIMEOUT = "AMG_VECTOR_SEARCH_TIMEOUT"
+    STORE_UNAVAILABLE = "AMG_STORE_UNAVAILABLE"
+    STORE_TIMEOUT = "AMG_STORE_TIMEOUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +79,16 @@ PROBLEM_TAXONOMY: Final[Mapping[ErrorCode, ProblemSpec]] = MappingProxyType(
             title="Vector search exceeded its deadline",
             status=504,
         ),
+        ErrorCode.STORE_UNAVAILABLE: ProblemSpec(
+            type=f"{_TYPE_URI_PREFIX}store-unavailable",
+            title="A backing store is unavailable",
+            status=503,
+        ),
+        ErrorCode.STORE_TIMEOUT: ProblemSpec(
+            type=f"{_TYPE_URI_PREFIX}store-timeout",
+            title="A backing store operation exceeded its deadline",
+            status=504,
+        ),
     }
 )
 
@@ -94,7 +108,7 @@ class MemoryProblemDetails(StrictModel):
     detail: Annotated[str, Strict(), Field(min_length=1, max_length=4096)]
     instance: Annotated[UriReference, Field(pattern=_URI_REFERENCE_PATTERN)] | None = None
     code: ErrorCode
-    context: FrozenJsonMapping
+    context: FrozenJsonMapping = Field(default_factory=EMPTY_JSON_MAPPING)
 
     @model_validator(mode="after")
     def _check_taxonomy(self) -> Self:
@@ -224,4 +238,39 @@ class VectorSearchTimeoutError(MemoryGraphError):
             f"Vector search{where} did not complete within {timeout_seconds:g}s.",
             instance=instance,
             context=context,
+        )
+
+
+class StoreUnavailableError(MemoryGraphError):
+    """A backing store (graph or vector) cannot be reached or refused the session."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.STORE_UNAVAILABLE
+
+    def __init__(self, store: str, *, instance: str | None = None) -> None:
+        self.store = store
+        super().__init__(
+            f"The {store} store is unavailable.", instance=instance, context={"store": store}
+        )
+
+
+class StoreTimeoutError(MemoryGraphError):
+    """A backing store operation other than vector search exceeded its deadline."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.STORE_TIMEOUT
+
+    def __init__(
+        self,
+        store: str,
+        operation: str,
+        timeout_seconds: float,
+        *,
+        instance: str | None = None,
+    ) -> None:
+        self.store = store
+        self.operation = operation
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"The {store} {operation} operation did not complete within {timeout_seconds:g}s.",
+            instance=instance,
+            context={"store": store, "operation": operation, "timeout_seconds": timeout_seconds},
         )
