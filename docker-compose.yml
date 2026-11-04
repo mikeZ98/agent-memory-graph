@@ -1,0 +1,136 @@
+# agent-memory-graph production stack.
+#
+#   export AMG_NEO4J_PASSWORD="$(openssl rand -base64 24)"
+#   export AMG_LLM_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=...   # optional
+#   docker compose up -d --wait
+#
+# Only the API is published, and only on the loopback interface. Neo4j and Qdrant
+# live on an internal network with no route to the outside world. Qdrant is reached
+# over plain HTTP on that network, so it runs without an API key (the app refuses
+# to send one over plaintext); put Qdrant behind TLS before enabling AMG_QDRANT_API_KEY.
+
+name: agent-memory-graph
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  agent-memory-graph:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AMG_EXTRAS: ${AMG_EXTRAS:-anthropic}
+    image: agent-memory-graph:local
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    ports:
+      - "127.0.0.1:${AMG_HTTP_PORT:-8000}:8000"
+    environment:
+      AMG_NEO4J_URI: bolt://neo4j:7687
+      AMG_NEO4J_USER: neo4j
+      AMG_NEO4J_PASSWORD: ${AMG_NEO4J_PASSWORD:?set AMG_NEO4J_PASSWORD}
+      AMG_NEO4J_DATABASE: ${AMG_NEO4J_DATABASE:-}
+      AMG_QDRANT_URL: http://qdrant:6333
+      AMG_QDRANT_COLLECTION: ${AMG_QDRANT_COLLECTION:-amg_entities}
+      AMG_EMBEDDING_DIM: ${AMG_EMBEDDING_DIM:-384}
+      AMG_DEFAULT_TIMEOUT_SECONDS: ${AMG_DEFAULT_TIMEOUT_SECONDS:-10}
+      AMG_LLM_MODEL: ${AMG_LLM_MODEL:-}
+      AMG_LLM_MAX_TOKENS: ${AMG_LLM_MAX_TOKENS:-16000}
+      AMG_MAX_CONCURRENT_EXTRACTIONS: ${AMG_MAX_CONCURRENT_EXTRACTIONS:-4}
+      AMG_MAX_CONCURRENT_STORE_OPERATIONS: ${AMG_MAX_CONCURRENT_STORE_OPERATIONS:-32}
+      AMG_QUEUE_TIMEOUT_SECONDS: ${AMG_QUEUE_TIMEOUT_SECONDS:-2}
+      AMG_BREAKER_FAILURE_THRESHOLD: ${AMG_BREAKER_FAILURE_THRESHOLD:-5}
+      AMG_BREAKER_RESET_SECONDS: ${AMG_BREAKER_RESET_SECONDS:-30}
+      AMG_INPUT_GUARD_MODE: ${AMG_INPUT_GUARD_MODE:-flag}
+      AMG_LOG_LEVEL: ${AMG_LOG_LEVEL:-info}
+      # Credentials for the provider named in AMG_LLM_MODEL.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - edge
+      - stores
+
+  neo4j:
+    <<: *hardening
+    image: neo4j:5.26.27-community@sha256:937fbd163e302a5751dd329b719c1b05e2a4293af223d61b1aa17e3dea087709
+    environment:
+      NEO4J_AUTH: neo4j/${AMG_NEO4J_PASSWORD:?set AMG_NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_dbms_usage__report_enabled: "false"
+    healthcheck:
+      # Bolt round trip on 7687; the password is read inside the container, not here.
+      test:
+        - CMD-SHELL
+        - cypher-shell -a bolt://localhost:7687 -u neo4j -p "$${NEO4J_AUTH#neo4j/}" "RETURN 1" >/dev/null
+      interval: 10s
+      timeout: 10s
+      start_period: 60s
+      retries: 10
+    volumes:
+      - neo4j-data:/data
+    networks:
+      - stores
+
+  qdrant:
+    <<: *hardening
+    image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    healthcheck:
+      # GET /readyz over bash's /dev/tcp (the image ships no curl/wget).
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 &&
+          printf "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 &&
+          head -n 1 <&3 | grep -q " 200 "'
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    networks:
+      - stores
+
+networks:
+  edge: {}
+  stores:
+    internal: true
+
+volumes:
+  neo4j-data: {}
+  qdrant-storage: {}

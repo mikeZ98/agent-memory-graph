@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Asynchronous GraphRAG long-term memory engine for AI agents, backed by Neo4j and Qdrant."
 authors = [{ name = "mikeZ98", email = "145975972+mikeZ98@users.noreply.github.com" }]
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -24,6 +26,14 @@ dependencies = [
   "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+anthropic = [
+    "anthropic>=2.5.0",
+]
+
+[project.scripts]
+agent-memory-graph = "agent_memory_graph.server:main"
+
 [dependency-groups]
 dev = [
   "pytest>=8.0.0",
@@ -35,6 +45,8 @@ dev = [
   "bandit[toml]>=1.7.9",
   "hypothesis>=6.100.0",
   "uvicorn>=0.30.0",
+  "pyyaml>=6.0.3",
+  "types-pyyaml>=6.0.12.20261103",
 ]
 
 [tool.uv]
@@ -53,7 +65,7 @@ packages = ["src/agent_memory_graph"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 cache-dir = ".cache/ruff"
 
 [tool.ruff.lint]
@@ -74,6 +86,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/**" = ["T201", "S603", "S607", "PLR0912", "PLR0915", "PLR2004"]
 "tests/**" = [
   "S101", "S105", "S106", "PLR2004", "ARG001", "ARG002", "FBT", "D", "SLF001", "ANN401",
 ]
@@ -95,7 +108,7 @@ python_version = "3.12"
 strict = true
 cache_dir = ".cache/mypy"
 mypy_path = "src"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]

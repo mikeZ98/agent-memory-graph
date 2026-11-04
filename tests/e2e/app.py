@@ -8,6 +8,7 @@ the subprocess needs no network and no external service.
 """
 
 import re
+import sys
 from collections.abc import Sequence
 from typing import Any, Final
 
@@ -24,9 +25,10 @@ from agent_memory_graph.services.extractor import ChatMessage, GraphExtractor
 from agent_memory_graph.services.retrieval import GraphMemoryService
 from tests.unit.doubles import InMemoryGraphStore, InMemoryVectorStore
 
-__all__ = ["CLOSED_MARKER", "RuleBasedLLM", "create_e2e_app"]
+__all__ = ["CLOSED_MARKER", "DEV_MODE_MARKER", "RuleBasedLLM", "create_e2e_app"]
 
 CLOSED_MARKER: Final = "amg-e2e: stores closed"
+DEV_MODE_MARKER: Final = "amg-e2e: dev_mode="
 EMBEDDING_DIM: Final = 64
 
 # Capitalised words; a dot only *inside* a word ("Node.js"), never the sentence's full stop.
@@ -104,5 +106,6 @@ def _build_service() -> GraphMemoryService:
 
 
 def create_e2e_app() -> FastAPI:
-    """Uvicorn factory (``tests.e2e.app:create_e2e_app``)."""
+    """Uvicorn factory (``python -m agent_memory_graph --factory tests.e2e.app:create_e2e_app``)."""
+    print(f"{DEV_MODE_MARKER}{sys.flags.dev_mode}", flush=True)  # noqa: T201
     return create_app(_build_service)

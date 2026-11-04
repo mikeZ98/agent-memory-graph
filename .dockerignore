@@ -1,0 +1,17 @@
+# Deny by default; the build context is only what the Dockerfile copies.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+
+# Never ship bytecode, caches or local secrets even if they appear under src/.
+**/__pycache__
+**/*.py[cod]
+**/.env
+**/.env.*
+**/.envrc*
+**/.cache
+**/.DS_Store

@@ -1,4 +1,4 @@
-"""End-to-end: the real ASGI stack in a ``python -X dev`` uvicorn subprocess.
+"""End-to-end: the production entrypoint (``python -X dev -m agent_memory_graph``).
 
 The server binds a Unix domain socket under ``.cache/e2e/`` (a relative path, which
 keeps it well under the ``sun_path`` length limit), so the test process keeps
@@ -22,8 +22,7 @@ from typing import Final
 import httpx
 import pytest
 
-from tests.e2e.app import CLOSED_MARKER
-from tests.e2e.serve import GRACEFUL_MARKER
+from tests.e2e.app import CLOSED_MARKER, DEV_MODE_MARKER
 
 pytestmark = [
     pytest.mark.e2e,
@@ -32,6 +31,7 @@ pytestmark = [
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 RUN_DIR: Final = Path(".cache") / "e2e"
+GRACEFUL_MARKER: Final = "graceful shutdown complete"
 STARTUP_DEADLINE: Final = 30.0
 SHUTDOWN_DEADLINE: Final = 15.0
 DEV_MODE_PROBLEMS: Final = (
@@ -104,7 +104,17 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[Server]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("AMG_")}
     with stdout.open("wb") as out, stderr.open("wb") as err:
         process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-            [sys.executable, "-X", "dev", "-m", "tests.e2e.serve", "--uds", str(uds)],
+            [
+                sys.executable,
+                "-X",
+                "dev",
+                "-m",
+                "agent_memory_graph",
+                "--factory",
+                "tests.e2e.app:create_e2e_app",
+                "--uds",
+                str(uds),
+            ],
             cwd=REPO_ROOT,
             env=env,
             stdout=out,
@@ -189,9 +199,8 @@ def test_full_client_scenario_and_graceful_shutdown(server: Server) -> None:
     assert server.process.wait(timeout=SHUTDOWN_DEADLINE) == 0, server.logs()
     stdout, stderr = server.stdout.read_text(), server.stderr.read_text()
     assert CLOSED_MARKER in stdout  # the lifespan closed both stores
-    assert GRACEFUL_MARKER in stdout
-    assert "dev_mode=True" in stdout  # -X dev really was active in the child
-    assert f"signals=[{int(signal.SIGTERM)}]" in stdout
+    assert f"{DEV_MODE_MARKER}True" in stdout  # -X dev really was active in the child
+    assert f"{GRACEFUL_MARKER} (signals: SIGTERM)" in stderr
     assert "Application startup complete." in stderr
     assert "Application shutdown complete." in stderr
     problems = [marker for marker in DEV_MODE_PROBLEMS if marker in stderr]
@@ -202,3 +211,4 @@ def test_sigint_is_also_graceful(server: Server) -> None:
     server.process.send_signal(signal.SIGINT)
     assert server.process.wait(timeout=SHUTDOWN_DEADLINE) == 0, server.logs()
     assert CLOSED_MARKER in server.stdout.read_text()
+    assert f"{GRACEFUL_MARKER} (signals: SIGINT)" in server.stderr.read_text()

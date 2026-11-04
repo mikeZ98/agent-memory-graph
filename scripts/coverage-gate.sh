@@ -5,6 +5,7 @@
 #   * services (extraction, embedding, retrieval): >= 95 %
 #   * HTTP API:                             >= 95 %
 #   * guardrails:                           >= 95 %
+#   * process entrypoint:                   >= 95 %
 #
 # Run after the test suite has produced coverage data (pytest runs with --cov);
 # the overall floor is enforced by pytest-cov itself (fail_under in pyproject.toml).
@@ -29,3 +30,4 @@ gate 95 "adapters + config" "src/agent_memory_graph/adapters/*" "src/agent_memor
 gate 95 "services" "src/agent_memory_graph/services/*"
 gate 95 "api" "src/agent_memory_graph/api/*"
 gate 95 "guardrails" "src/agent_memory_graph/guardrails/*"
+gate 95 "entrypoint" "src/agent_memory_graph/server.py" "src/agent_memory_graph/__main__.py"

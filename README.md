@@ -5,9 +5,8 @@ a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts 
 entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
 them over **FastAPI**.
 
-> Status: service + HTTP API with guardrails. Ingestion, GraphRAG retrieval, the
-> FastAPI endpoints, concurrency limits, circuit breakers and telemetry work end to end;
-> deployment packaging comes next.
+> Status: deployable. Ingestion, GraphRAG retrieval, the FastAPI endpoints, guardrails
+> and telemetry work end to end, packaged as a hardened container with a Compose stack.
 
 ## Domain model
 
@@ -226,6 +225,69 @@ no unawaited coroutines, `ResourceWarning`s or tracebacks on stderr. Uvicorn re-
 the shutdown signal after a graceful stop. The launcher installs the handler uvicorn
 restores, so a completed graceful shutdown exits 0 explicitly.
 
+## Running
+
+```bash
+python -m agent_memory_graph                     # 127.0.0.1:8000, AMG_* settings
+python -m agent_memory_graph --host 0.0.0.0 --port 8080
+python -m agent_memory_graph --uds .cache/run/amg.sock --factory pkg.module:make_app
+```
+
+The entrypoint runs uvicorn in-process. Settings are validated at startup (a bad
+configuration exits 3). SIGTERM or SIGINT drains in-flight requests, the lifespan
+closes the connection pools, and the process exits **0**. `AMG_LLM_MODEL` selects the
+extraction model in instructor's `provider/model` form (for example
+`anthropic/claude-opus-5-5`, installed with the `anthropic` extra). Credentials come
+from the provider's own variables, such as `ANTHROPIC_API_KEY`. Without
+`AMG_LLM_MODEL`, queries work and ingestion answers `AMG_EXTRACTION_FAILED`. The
+default app embeds with the lexical hashing embedder; plug a semantic
+`EmbeddingService` into `build_memory_service` for production-grade recall.
+
+## Container
+
+```bash
+export AMG_NEO4J_PASSWORD="$(openssl rand -base64 24)"
+export AMG_LLM_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=...   # optional
+docker compose up -d --wait          # API on 127.0.0.1:8000
+```
+
+**Image** (`Dockerfile`):
+
+- A multi-stage build. Every base image (`python:3.12.13-slim-trixie`, `uv:0.11.7`) is
+  pinned by digest. uv builds a frozen, non-editable, bytecode-compiled virtualenv in
+  `/opt/venv`.
+- The runtime is the same CPython with pip, `apt`/`dpkg` and their state removed and
+  every setuid/setgid bit stripped. It runs as `appuser` `10001:10001` and the venv is
+  root-owned, so it's immutable to the app.
+- It works with `--read-only`: only `/tmp` (tmpfs) is written, and
+  `PYTHONDONTWRITEBYTECODE=1` is set.
+- The exec-form `ENTRYPOINT ["python", "-m", "agent_memory_graph"]` has no shell
+  wrapper, so SIGTERM reaches PID 1 directly. `STOPSIGNAL SIGTERM` and an exec-form
+  Python `HEALTHCHECK` are set.
+- It carries OCI labels (SPDX `MIT`, source repository, version and revision build
+  args). Provider SDKs are opt-in: `--build-arg AMG_EXTRAS=anthropic`.
+
+**Stack** (`docker-compose.yml`):
+
+- The API runs `read_only`, with `cap_drop: [ALL]`, `no-new-privileges`, user
+  `10001:10001`, a `noexec,nosuid` tmpfs at `/tmp`, and pids and memory limits. It's
+  published on `127.0.0.1` only.
+- Neo4j 5.26 LTS and Qdrant 1.20 are pinned by tag and digest, with healthchecks
+  (a Bolt `RETURN 1` on 7687 and `GET /readyz`). They sit on an `internal` network with
+  no published ports. The API waits for both to be healthy.
+- `AMG_NEO4J_PASSWORD` is mandatory, and no secret is ever written into the file.
+
+**Smoke tests** (`scripts/smoke-docker.sh`):
+
+| Mode | Needs | Checks |
+| ---- | ----- | ------ |
+| `--offline` | nothing | `scripts/container_policy.py` (digest pins, final `USER 10001:10001`, appuser UID/GID, exec-form entrypoint without shell, setuid strip, package-manager and pip removal, HEALTHCHECK, STOPSIGNAL, OCI and SPDX labels, no baked secrets, Hadolint DL3000/2/4/6/7/15/20/25/42; a deny-by-default `.dockerignore`; Compose hardening, mandatory password, digest-pinned stores on an internal network, store healthchecks), `hadolint` when installed, and `docker compose config` |
+| default | + daemon | offline checks, then build the image and assert, inside a `--read-only --cap-drop ALL` container, uid 10001, no package managers or compilers, no setuid files, a read-only root and a writable `/tmp` |
+| `--live` | + daemon, image pulls | boot the whole stack, probe `/health`, SIGTERM the API and require exit code 0 plus a logged graceful shutdown |
+
+The offline mode runs in the test suite (`tests/unit/test_container_policy.py`), which
+also mutates the shipped files to prove that every rule fires.
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -251,6 +313,14 @@ Settings are read from `AMG_*` environment variables only; `.env` files are neve
 | `AMG_INPUT_GUARD_MODE`         | `flag`                   | `flag` or `reject`                     |
 | `AMG_RETRIEVAL_FALLBACK_STEPS` | `3`                      | 0 disables the fallback                |
 | `AMG_RETRIEVAL_FALLBACK_FLOOR` | `0.1`                    | lowest threshold a fallback may use    |
+| `AMG_LLM_MODEL`                | unset                    | `provider/model` for instructor, e.g. `anthropic/claude-opus-5-5` |
+| `AMG_LLM_MAX_TOKENS`           | `16000`                  | per extraction call                    |
+| `AMG_HTTP_HOST` / `AMG_HTTP_PORT` | `127.0.0.1` / `8000`  | launcher defaults (the image binds `0.0.0.0`) |
+| `AMG_LOG_LEVEL`                | `info`                   | launcher log level                     |
+| `AMG_GRACEFUL_TIMEOUT_SECONDS` | `10`                     | drain time after SIGTERM               |
+
+Empty values (as Compose passes for unset `${VAR:-}`) mean *unset* for the optional
+`AMG_NEO4J_DATABASE`, `AMG_QDRANT_API_KEY` and `AMG_LLM_MODEL`.
 
 ## Quickstart
 
@@ -299,11 +369,13 @@ src/agent_memory_graph/   package (typed: ships py.typed)
   api/                    FastAPI app, endpoints, RFC 9457 handlers, body limit
   guardrails/             limiters, circuit breakers, input/traversal guards, telemetry
   config.py               AMG_* settings
+  server.py, __main__.py  process entrypoint (python -m agent_memory_graph)
 tests/                    hermetic test suite (conftest scrubs service credentials)
   unit/                   unit, API and property-based tests
   e2e/                    uvicorn subprocess harness (python -X dev, Unix socket)
 .githooks/                git hooks + shared policy
-scripts/                  audits used by the hooks, per-layer coverage gate
+scripts/                  audits, coverage gate, container policy + smoke tests
+Dockerfile, .dockerignore, docker-compose.yml   hardened image and stack
 .envrc                    direnv: cache isolation under ./.cache/ and git wiring
 ```
 

@@ -9,7 +9,7 @@ import ipaddress
 from typing import Annotated, Final, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
-from pydantic import AfterValidator, Field, SecretStr, model_validator
+from pydantic import AfterValidator, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agent_memory_graph.domain.models import MAX_EMBEDDING_DIMENSIONS
@@ -22,6 +22,8 @@ DEFAULT_EMBEDDING_DIM: Final = 384
 NEO4J_SCHEMES: Final = frozenset({"neo4j", "neo4j+s", "neo4j+ssc", "bolt", "bolt+s", "bolt+ssc"})
 HTTP_SCHEMES: Final = frozenset({"http", "https"})
 _COLLECTION_PATTERN: Final = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$"
+# instructor.from_provider() reference: "<provider>/<model>", e.g. "anthropic/claude-opus-5-5".
+_LLM_MODEL_PATTERN: Final = r"^[a-z][a-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$"
 
 
 def _split_endpoint(value: str, schemes: frozenset[str]) -> SplitResult:
@@ -84,6 +86,10 @@ class Settings(BaseSettings):
     neo4j_max_pool_size: Annotated[int, Field(ge=1, le=1000)] = 50
     qdrant_upsert_batch_size: Annotated[int, Field(ge=1, le=10_000)] = 256
 
+    # Extraction model (None: ingestion answers AMG_EXTRACTION_FAILED until configured)
+    llm_model: Annotated[str, Field(pattern=_LLM_MODEL_PATTERN)] | None = None
+    llm_max_tokens: Annotated[int, Field(ge=256, le=128_000)] = 16_000
+
     # Guardrails
     max_concurrent_extractions: Annotated[int, Field(ge=1, le=256)] = 4
     max_concurrent_store_operations: Annotated[int, Field(ge=1, le=1000)] = 32
@@ -93,6 +99,12 @@ class Settings(BaseSettings):
     input_guard_mode: Literal["flag", "reject"] = "flag"
     retrieval_fallback_steps: Annotated[int, Field(ge=0, le=10)] = 3
     retrieval_fallback_floor: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 0.1
+
+    @field_validator("neo4j_database", "qdrant_api_key", "llm_model", mode="before")
+    @classmethod
+    def _empty_means_unset(cls, value: object) -> object:
+        # Compose and shells pass unset optionals as "": treat that as "not configured".
+        return None if isinstance(value, str) and not value.strip() else value
 
     @model_validator(mode="after")
     def _no_api_key_over_plaintext(self) -> Self:
