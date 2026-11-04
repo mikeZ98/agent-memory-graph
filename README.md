@@ -199,6 +199,33 @@ service down. `build_memory_service` wires all of it from settings.
 | **Adaptive fallback** (`RetrievalPolicy`) | If the requested `score_threshold` finds no seeds, it's retried at ×0.8 per step, for up to `AMG_RETRIEVAL_FALLBACK_STEPS` extra searches and never below `AMG_RETRIEVAL_FALLBACK_FLOOR`. `confidence` then reflects the weaker match. |
 | **Telemetry** (`Telemetry`) | Request and failure counters, latency (count, sum, min, max, mean, p50/p95/p99, cumulative buckets), entities and relations indexed, pruned candidates and hops, suspicious inputs, fallbacks, and live queue occupancy and circuit states, served at `GET /metrics`. |
 
+## Verification
+
+**Property-based fuzzing** (`tests/unit/test_fuzzing.py`) checks these invariants:
+
+- `InputGuard` never raises in flag mode, and its output contains no chat-template
+  token, forged delimiter or role header. Re-scanning the output finds nothing, so
+  defanging is a fixed point. Reject mode raises exactly when something was found.
+- `make_entity_id` is deterministic, already canonical, padding- and (for ASCII)
+  case-insensitive, and namespaced by type.
+- Any LLM extraction payload becomes a `KnowledgeGraph` that holds integrity, or the
+  offending candidates are pruned.
+- `TraversalGuard` respects its degree, fan-out and cycle limits on random graphs,
+  1 500-leaf stars, rings and 20 000-hop chains. Every kept path stays anchored to a
+  seed, and the report adds up.
+- Fallback thresholds start at the requested value, decrease strictly, never go below
+  the floor, take at most `max_fallback_steps` steps, and stop early only at the floor.
+
+**End-to-end harness** (`tests/e2e/`): `tests.e2e.serve` runs the production ASGI app,
+service and guardrails under uvicorn with `python -X dev`, on a Unix socket in
+`.cache/e2e/`. Stores are in memory, and a deterministic rule-based model stands in for
+the LLM. The test probes `/health`, ingests a multi-turn conversation that includes a
+forged `System:` line, queries it, checks the markdown summary and the `/metrics`
+counters, then sends SIGTERM. It expects exit 0, the lifespan closing both stores, and
+no unawaited coroutines, `ResourceWarning`s or tracebacks on stderr. Uvicorn re-raises
+the shutdown signal after a graceful stop. The launcher installs the handler uvicorn
+restores, so a completed graceful shutdown exits 0 explicitly.
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -234,6 +261,8 @@ uv sync               # creates .cache/venv with runtime + dev dependencies
 ruff check . && ruff format --check .
 mypy                  # strict mode, configured in pyproject.toml
 pytest                # hermetic: inet sockets blocked, no live services
+HYPOTHESIS_PROFILE=ci pytest -m fuzz   # deeper property fuzzing (200 examples)
+pytest -m e2e         # uvicorn subprocess over a Unix socket
 scripts/coverage-gate.sh   # domain 100 %; adapters, config, services, api, guardrails >= 95 %
 bandit -c pyproject.toml -r src
 ```
@@ -248,6 +277,8 @@ commands with `uv run`.
 | Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
 | Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
 | Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
+| Fuzzing      | `hypothesis` (`tests/unit/test_fuzzing.py`) | Property-based invariants; `dev` profile with 50 examples, `ci` with 200 (derandomised); state in `.cache/hypothesis/` |
+| End to end   | `tests/e2e/` (`python -X dev`, uvicorn) | Full HTTP scenario in a subprocess, clean SIGTERM/SIGINT exit 0, no dev-mode warnings |
 | Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/`, `api/`, `guardrails/` (line + branch) |
 | Security     | `bandit`                            | Static security scan of `src/`                                  |
 | `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
@@ -269,6 +300,8 @@ src/agent_memory_graph/   package (typed: ships py.typed)
   guardrails/             limiters, circuit breakers, input/traversal guards, telemetry
   config.py               AMG_* settings
 tests/                    hermetic test suite (conftest scrubs service credentials)
+  unit/                   unit, API and property-based tests
+  e2e/                    uvicorn subprocess harness (python -X dev, Unix socket)
 .githooks/                git hooks + shared policy
 scripts/                  audits used by the hooks, per-layer coverage gate
 .envrc                    direnv: cache isolation under ./.cache/ and git wiring

@@ -83,9 +83,10 @@ def fallback_thresholds(threshold: float, policy: RetrievalPolicy) -> tuple[floa
     thresholds = [threshold]
     current = threshold
     for _ in range(policy.max_fallback_steps):
-        if current <= policy.fallback_floor:
+        relaxed = max(policy.fallback_floor, current * policy.fallback_factor)
+        if relaxed >= current:  # at the floor (or a subnormal that cannot shrink): stop
             break
-        current = max(policy.fallback_floor, round(current * policy.fallback_factor, 6))
+        current = relaxed
         thresholds.append(current)
     return tuple(thresholds)
 
