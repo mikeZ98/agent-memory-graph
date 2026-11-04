@@ -37,6 +37,7 @@ from qdrant_client.http.models import (
 
 from agent_memory_graph.adapters import Neo4jGraphStore, QdrantVectorStore
 from agent_memory_graph.adapters.neo4j import (
+    FETCH_ENTITIES,
     MERGE_ENTITIES,
     SCHEMA_STATEMENTS,
     WRITE_BATCH_SIZE,
@@ -1164,3 +1165,117 @@ class TestRealClientsStayOffline:
         cause = exc.value.__cause__
         assert isinstance(cause, ResponseHandlingException)
         assert isinstance(cause.source, SocketBlockedError)
+
+
+# ---------------------------------------------------------------------------
+# Neo4j entity lookup and health probe
+# ---------------------------------------------------------------------------
+ENTITY_ROWS: Rows = [
+    {"id": "tool-qdrant", "name": "Qdrant", "entity_type": "TOOL", "description": "",
+     "attributes_json": "{}"},
+    {"id": "tool-neo4j", "name": "Neo4j", "entity_type": "TOOL", "description": "Graph DB.",
+     "attributes_json": '{"license":"GPL","tags":["graph"]}'},
+]  # fmt: skip
+
+
+class TestFetchEntities:
+    async def test_returns_entities_in_requested_order_skipping_unknown_ids(self) -> None:
+        driver = FakeDriver(lambda _q, _p: ENTITY_ROWS)
+        store, _ = make_graph_store(driver)
+        await store.connect()
+        entities = await store.fetch_entities(["tool-neo4j", "tool-missing", "tool-qdrant"])
+        assert [e.id for e in entities] == ["tool-neo4j", "tool-qdrant"]
+        assert entities[0].attributes == {"license": "GPL", "tags": ("graph",)}
+        assert entities[0].embedding is None
+        ((query, params),) = driver.tx.calls
+        assert query == FETCH_ENTITIES
+        assert params == {"ids": ["tool-neo4j", "tool-missing", "tool-qdrant"]}
+        assert driver.modes == ["read"]
+
+    async def test_no_ids_means_no_query(
+        self, graph_store: tuple[Neo4jGraphStore, FakeDriver]
+    ) -> None:
+        store, driver = graph_store
+        assert await store.fetch_entities([]) == ()
+        assert driver.databases == []
+
+    @pytest.mark.parametrize(
+        ("ids", "error", "match"),
+        [
+            ("tool-x", TypeError, "entity_ids must be a sequence"),
+            (["Bad Id"], ValueError, "entity_ids contains an invalid entity id"),
+            ([f"t-{i}" for i in range(3001)], ValueError, "at most 3000 entity_ids"),
+        ],
+    )
+    async def test_invalid_ids(
+        self,
+        graph_store: tuple[Neo4jGraphStore, FakeDriver],
+        ids: Sequence[str],
+        error: type[Exception],
+        match: str,
+    ) -> None:
+        store, _ = graph_store
+        with pytest.raises(error, match=match):
+            await store.fetch_entities(ids)
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {**ENTITY_ROWS[0], "attributes_json": "{not json"},
+            {**ENTITY_ROWS[0], "entity_type": "ANIMAL"},
+            {**ENTITY_ROWS[0], "name": None},
+            {k: v for k, v in ENTITY_ROWS[0].items() if k != "name"},
+        ],
+    )
+    async def test_stored_nodes_violating_the_contract_fail_closed(
+        self, row: dict[str, Any]
+    ) -> None:
+        store, _ = make_graph_store(FakeDriver(lambda _q, _p: [row]))
+        await store.connect()
+        with pytest.raises(MemoryGraphError, match="entity that violates the domain contract"):
+            await store.fetch_entities(["tool-qdrant"])
+
+
+class TestPing:
+    async def test_neo4j_ping_verifies_connectivity(
+        self, graph_store: tuple[Neo4jGraphStore, FakeDriver]
+    ) -> None:
+        store, driver = graph_store
+        await store.ping()
+        assert driver.verified == 2  # connect + ping
+
+    async def test_neo4j_ping_maps_failures(
+        self, graph_store: tuple[Neo4jGraphStore, FakeDriver]
+    ) -> None:
+        store, driver = graph_store
+        driver.verify_error = ServiceUnavailable("down")
+        with pytest.raises(StoreUnavailableError):
+            await store.ping()
+        driver.verify_error, driver.verify_hangs = None, True
+        with pytest.raises(StoreTimeoutError) as exc:
+            await store.ping()
+        assert exc.value.operation == "ping"
+
+    async def test_neo4j_ping_requires_connect(self) -> None:
+        store, _ = make_graph_store()
+        with pytest.raises(MemoryGraphError, match=r"ping\(\) called before connect"):
+            await store.ping()
+
+    async def test_qdrant_ping_checks_the_collection(self) -> None:
+        store, client = await connected_vector_store()
+        await store.ping()
+        assert client.called("collection_exists") == [(("memories",), {})]
+
+    async def test_qdrant_ping_maps_failures(self) -> None:
+        client = FakeQdrant()
+        client.errors["collection_exists"] = unexpected(503)
+        store, _ = await connected_vector_store(client)
+        with pytest.raises(StoreUnavailableError):
+            await store.ping()
+
+
+class TestScoredSearch:
+    async def test_scores_are_returned_best_first_and_deduplicated(self) -> None:
+        client = FakeQdrant(points=[{"entity_id": "tool-a"}, {"entity_id": "tool-a"}])
+        store, _ = await connected_vector_store(client)
+        assert await store.search_scored(VECTOR, 5, 0.0) == [("tool-a", 0.9)]

@@ -29,7 +29,11 @@ from instructor.core.exceptions import InstructorError, InstructorRetryException
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter, ValidationError
 
 from agent_memory_graph.domain._base import sanitize_line, sanitize_multiline
-from agent_memory_graph.domain.errors import ExtractionFailedError, ExtractionTimeoutError
+from agent_memory_graph.domain.errors import (
+    ExtractionFailedError,
+    ExtractionTimeoutError,
+    InvalidInputError,
+)
 from agent_memory_graph.domain.models import (
     MAX_DESCRIPTION_LENGTH,
     MAX_ENTITY_NAME_LENGTH,
@@ -250,10 +254,18 @@ class GraphExtraction(BaseModel):
 def prepare_conversation(text: str, *, max_chars: int = DEFAULT_MAX_INPUT_CHARS) -> str:
     """Return ``text`` cleaned for prompting; ``""`` when nothing printable remains.
 
-    Raises ``ValueError`` when the cleaned text is longer than ``max_chars``: callers
-    should split long transcripts rather than have them silently truncated.
+    Raises :class:`InvalidInputError` when the cleaned text is longer than
+    ``max_chars``: callers should split long transcripts rather than have them
+    silently truncated.
     """
-    cleaned = sanitize_multiline(text, max_length=max_chars)
+    try:
+        cleaned = sanitize_multiline(text, max_length=max_chars)
+    except ValueError as exc:
+        msg = f"Conversation text exceeds {max_chars} characters; split it into smaller turns."
+        raise InvalidInputError(
+            msg,
+            errors=[{"loc": ["text"], "msg": str(exc), "type": "string_too_long"}],
+        ) from exc
     # Neutralise delimiter look-alikes so the text cannot close its own wrapper.
     return _DELIMITER_RE.sub(lambda m: f"[{m.group(1)}conversation]", cleaned)
 
@@ -411,7 +423,7 @@ class GraphExtractor:
         """Extract a graph from ``text`` together with a report of what was pruned.
 
         Returns an empty graph, without calling the model, when ``text`` has no
-        printable content. Raises ``ValueError`` for oversized input,
+        printable content. Raises :class:`InvalidInputError` for oversized input,
         :class:`ExtractionTimeoutError` past the deadline, and
         :class:`ExtractionFailedError` when the model cannot produce valid output.
         """

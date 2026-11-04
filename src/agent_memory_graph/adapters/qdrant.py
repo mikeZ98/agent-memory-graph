@@ -307,6 +307,14 @@ class QdrantVectorStore:
             await self._call("upsert_entities", upsert, collection=self.collection)
         return len(points)
 
+    async def ping(self) -> None:
+        """Check that Qdrant answers authenticated requests within the deadline."""
+
+        async def probe(client: AsyncQdrantClient) -> bool:
+            return await client.collection_exists(self.collection)
+
+        await self._call("ping", probe, collection=self.collection)
+
     async def search_seeds(
         self,
         query_vector: Sequence[float],
@@ -319,6 +327,17 @@ class QdrantVectorStore:
         ``allowed_types=None`` searches every type; an empty sequence matches nothing.
         Raises :class:`VectorSearchTimeoutError` when the deadline is exceeded.
         """
+        scored = await self.search_scored(query_vector, top_k, score_threshold, allowed_types)
+        return [entity_id for entity_id, _ in scored]
+
+    async def search_scored(
+        self,
+        query_vector: Sequence[float],
+        top_k: int,
+        score_threshold: float,
+        allowed_types: Sequence[EntityType] | None = None,
+    ) -> list[tuple[str, float]]:
+        """Like :meth:`search_seeds`, but pair each id with its cosine similarity."""
         vector = _check_vector(query_vector, self.embedding_dim, "query vector")
         top_k = _TOP_K.validate_python(top_k)
         score_threshold = _SCORE_THRESHOLD.validate_python(score_threshold)
@@ -331,7 +350,7 @@ class QdrantVectorStore:
                 must=[FieldCondition(key=PAYLOAD_ENTITY_TYPE, match=MatchAny(any=types))]
             )
 
-        async def search(client: AsyncQdrantClient) -> list[object]:
+        async def search(client: AsyncQdrantClient) -> list[tuple[object, float]]:
             response = await client.query_points(
                 self.collection,
                 query=vector,
@@ -342,14 +361,20 @@ class QdrantVectorStore:
                 with_vectors=False,
                 timeout=self._request_timeout,
             )
-            return [(point.payload or {}).get(PAYLOAD_ENTITY_ID) for point in response.points]
+            return [
+                ((point.payload or {}).get(PAYLOAD_ENTITY_ID), float(point.score))
+                for point in response.points
+            ]
 
-        raw_ids = await self._call("search_seeds", search, collection=self.collection, search=True)
+        raw = await self._call("search_seeds", search, collection=self.collection, search=True)
         try:
-            ids = [_ENTITY_ID.validate_python(raw) for raw in raw_ids]
+            scored = [(_ENTITY_ID.validate_python(eid), score) for eid, score in raw]
         except ValidationError as exc:
             msg = "Qdrant returned a point whose entity_id payload is missing or invalid."
             raise MemoryGraphError(
                 msg, context={"store": STORE_NAME, "collection": self.collection}
             ) from exc
-        return list(dict.fromkeys(ids))
+        best: dict[str, float] = {}
+        for entity_id, score in scored:
+            best.setdefault(entity_id, score)  # results arrive best-first
+        return list(best.items())

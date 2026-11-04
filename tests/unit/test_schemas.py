@@ -20,6 +20,7 @@ from agent_memory_graph.domain import (
     ExtractionTimeoutError,
     GraphContext,
     GraphHop,
+    InvalidInputError,
     KnowledgeGraph,
     MemoryGraphError,
     MemoryProblemDetails,
@@ -692,6 +693,26 @@ class TestDomainErrors:
         assert problem.detail == "Knowledge extraction failed: bad output."
         assert problem.context == context
 
+    def test_invalid_input_error_never_echoes_input(self) -> None:
+        error = InvalidInputError(
+            "bad request",
+            errors=[
+                {"loc": ("body", "text", 0), "msg": "too long", "type": "string_too_long",
+                 "input": "secret-value", "ctx": {"max_length": 3}},
+                {"loc": (), "msg": 42},
+                {},
+            ],
+        )  # fmt: skip
+        assert error.status == 422
+        assert error.to_problem().to_json_dict()["context"] == {
+            "errors": [
+                {"loc": ["body", "text", 0], "msg": "too long", "type": "string_too_long"},
+                {"loc": [], "msg": "42", "type": "value_error"},
+                {"loc": [], "msg": "", "type": "value_error"},
+            ]
+        }
+        assert "secret-value" not in str(error.to_problem().to_json_dict())
+
     def test_extraction_timeout_error(self) -> None:
         error = ExtractionTimeoutError(30.0)
         assert (error.timeout_seconds, error.status) == (30.0, 504)
@@ -734,6 +755,7 @@ class TestDomainErrors:
             StoreTimeoutError,
             ExtractionFailedError,
             ExtractionTimeoutError,
+            InvalidInputError,
         ],
     )
     def test_each_error_has_its_own_code(self, error_type: type[MemoryGraphError]) -> None:

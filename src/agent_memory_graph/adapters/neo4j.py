@@ -16,7 +16,7 @@ as canonical JSON strings (``attributes_json``/``properties_json``).
 import asyncio
 import json
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Annotated, Any, Final, Literal, Self
 
@@ -57,6 +57,7 @@ from agent_memory_graph.domain.query import (
 )
 
 __all__ = [
+    "FETCH_ENTITIES",
     "MERGE_ENTITIES",
     "SCHEMA_STATEMENTS",
     "STORE_NAME",
@@ -68,6 +69,7 @@ __all__ = [
 STORE_NAME: Final = "neo4j"
 WRITE_BATCH_SIZE: Final = 1_000
 MAX_SEED_IDS: Final = 1_000
+MAX_FETCH_IDS: Final = MAX_SEED_IDS + 2 * MAX_CONTEXT_HOPS
 
 _TIMEOUT_CODES: Final = frozenset(
     {
@@ -99,6 +101,16 @@ MERGE (s)-[r:`{predicate}`]->(t)
 SET r.weight = row.weight,
     r.properties_json = row.properties_json
 RETURN count(r) AS written
+"""
+
+FETCH_ENTITIES: Final = """
+MATCH (e:Entity)
+WHERE e.id IN $ids
+RETURN e.id AS id,
+       e.name AS name,
+       e.type AS entity_type,
+       coalesce(e.description, '') AS description,
+       coalesce(e.attributes_json, '{}') AS attributes_json
 """
 
 _TRAVERSAL_TEMPLATE: Final = """
@@ -179,19 +191,32 @@ def _chunks[T](rows: Sequence[T], size: int) -> Iterator[Sequence[T]]:
         yield rows[start : start + size]
 
 
-def _normalize_seed_ids(seed_ids: Sequence[str]) -> list[str]:
-    if isinstance(seed_ids, str):
-        msg = "seed_ids must be a sequence of ids, not a single string"
+def _normalize_ids(ids: Sequence[str], *, limit: int, what: str = "seed_ids") -> list[str]:
+    if isinstance(ids, str):
+        msg = f"{what} must be a sequence of ids, not a single string"
         raise TypeError(msg)
     try:
-        normalized = list(dict.fromkeys(_ENTITY_ID.validate_python(eid) for eid in seed_ids))
+        normalized = list(dict.fromkeys(_ENTITY_ID.validate_python(eid) for eid in ids))
     except ValidationError as exc:
-        msg = "seed_ids contains an invalid entity id"
+        msg = f"{what} contains an invalid entity id"
         raise ValueError(msg) from exc
-    if len(normalized) > MAX_SEED_IDS:
-        msg = f"at most {MAX_SEED_IDS} seed ids are allowed"
+    if len(normalized) > limit:
+        msg = f"at most {limit} {what} are allowed"
         raise ValueError(msg)
     return normalized
+
+
+def _entity_from_row(row: Mapping[str, Any]) -> Entity:
+    attributes = json.loads(row["attributes_json"])
+    return Entity.model_validate(
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "entity_type": row["entity_type"],
+            "description": row["description"],
+            "attributes": attributes,
+        }
+    )
 
 
 async def _run_rows(
@@ -312,6 +337,18 @@ class Neo4jGraphStore:
             if driver is not None:
                 await driver.close()
 
+    async def ping(self) -> None:
+        """Check that the server answers with the configured credentials."""
+        driver = self._driver
+        if driver is None:
+            msg = "Neo4jGraphStore.ping() called before connect()"
+            raise MemoryGraphError(msg, context={"store": STORE_NAME})
+        try:
+            async with asyncio.timeout(self._timeout):
+                await driver.verify_connectivity()
+        except (TimeoutError, Neo4jError, DriverError) as exc:
+            raise _translate(exc, "ping", self._timeout) from exc
+
     async def __aenter__(self) -> Self:
         await self.connect()
         return self
@@ -400,7 +437,7 @@ class Neo4jGraphStore:
         """
         statement = traversal_statement(depth)
         limit = _HOP_LIMIT.validate_python(limit)
-        ids = _normalize_seed_ids(seed_ids)
+        ids = _normalize_ids(seed_ids, limit=MAX_SEED_IDS)
         if not ids:
             return ()
 
@@ -413,3 +450,24 @@ class Neo4jGraphStore:
         except ValidationError as exc:
             msg = "Neo4j returned a relation that violates the domain contract."
             raise MemoryGraphError(msg, context={"store": STORE_NAME}) from exc
+
+    async def fetch_entities(self, entity_ids: Sequence[str]) -> tuple[Entity, ...]:
+        """Return the stored entities among ``entity_ids``, in the order requested.
+
+        Unknown ids are skipped. Embeddings live in the vector store and are not
+        included. A stored node that violates the domain contract fails closed.
+        """
+        ids = _normalize_ids(entity_ids, limit=MAX_FETCH_IDS, what="entity_ids")
+        if not ids:
+            return ()
+
+        async def work(tx: AsyncManagedTransaction) -> list[dict[str, Any]]:
+            return await _run_rows(tx, FETCH_ENTITIES, {"ids": ids})
+
+        rows = await self._execute("read", "fetch_entities", work)
+        try:
+            found = {entity.id: entity for entity in map(_entity_from_row, rows)}
+        except (ValueError, TypeError, KeyError) as exc:  # ValidationError, JSONDecodeError
+            msg = "Neo4j returned an entity that violates the domain contract."
+            raise MemoryGraphError(msg, context={"store": STORE_NAME}) from exc
+        return tuple(found[eid] for eid in ids if eid in found)

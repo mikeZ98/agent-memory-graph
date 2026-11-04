@@ -21,7 +21,7 @@ import pytest
 from instructor import AsyncInstructor, Mode
 from instructor.core.exceptions import InstructorError, InstructorRetryException
 from openai.types.chat import ChatCompletion
-from pydantic import BaseModel, SecretStr, ValidationError
+from pydantic import SecretStr, ValidationError
 
 from agent_memory_graph.config import Settings
 from agent_memory_graph.domain import (
@@ -29,6 +29,7 @@ from agent_memory_graph.domain import (
     EntityType,
     ExtractionFailedError,
     ExtractionTimeoutError,
+    InvalidInputError,
     KnowledgeGraph,
     make_entity_id,
 )
@@ -44,10 +45,10 @@ from agent_memory_graph.services import (
 from agent_memory_graph.services.embedder import with_embeddings
 from agent_memory_graph.services.extractor import (
     SYSTEM_PROMPT,
-    ChatMessage,
     build_knowledge_graph,
     prepare_conversation,
 )
+from tests.unit.doubles import ScriptedLLM
 
 CONVERSATION = """\
 User: Hi! I'm Ada Lovelace and I work at Analytical Engines Ltd in London.
@@ -97,32 +98,6 @@ async def _forever() -> None:
 # ---------------------------------------------------------------------------
 # Doubles
 # ---------------------------------------------------------------------------
-class ScriptedLLM:
-    """:class:`StructuredLLM` returning scripted payloads (or raising scripted errors)."""
-
-    def __init__(self, *responses: dict[str, Any] | BaseException, hang: bool = False) -> None:
-        self._responses = list(responses)
-        self.hang = hang
-        self.calls: list[dict[str, Any]] = []
-
-    async def create[T: BaseModel](
-        self, *, response_model: type[T], messages: Sequence[ChatMessage], max_retries: int
-    ) -> T:
-        self.calls.append(
-            {
-                "response_model": response_model,
-                "messages": list(messages),
-                "max_retries": max_retries,
-            }
-        )
-        if self.hang:
-            await _forever()
-        response = self._responses.pop(0)
-        if isinstance(response, BaseException):
-            raise response
-        return response_model.model_validate(response)
-
-
 def completion(arguments: dict[str, Any] | str) -> ChatCompletion:
     """An OpenAI-shaped completion whose only content is a GraphExtraction tool call."""
     raw = arguments if isinstance(arguments, str) else json.dumps(arguments)
@@ -187,8 +162,12 @@ class TestInputGuard:
 
     async def test_oversized_input_is_rejected_not_truncated(self) -> None:
         llm = ScriptedLLM()
-        with pytest.raises(ValueError, match="exceeds 100 characters"):
+        with pytest.raises(InvalidInputError, match="exceeds 100 characters") as exc:
             await GraphExtractor(llm, max_input_chars=100).extract_triplets("word " * 30)
+        assert exc.value.status == 422
+        assert exc.value.errors == (
+            {"loc": ["text"], "msg": "text exceeds 100 characters", "type": "string_too_long"},
+        )
         assert llm.calls == []
 
     def test_invisible_and_control_characters_are_stripped(self) -> None:

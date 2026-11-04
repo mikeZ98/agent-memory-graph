@@ -23,6 +23,7 @@ __all__ = [
     "ErrorCode",
     "ExtractionFailedError",
     "ExtractionTimeoutError",
+    "InvalidInputError",
     "MemoryGraphError",
     "MemoryProblemDetails",
     "ProblemSpec",
@@ -50,6 +51,7 @@ class ErrorCode(StrEnum):
     STORE_TIMEOUT = "AMG_STORE_TIMEOUT"
     EXTRACTION_FAILED = "AMG_EXTRACTION_FAILED"
     EXTRACTION_TIMEOUT = "AMG_EXTRACTION_TIMEOUT"
+    INVALID_INPUT = "AMG_INVALID_INPUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +104,11 @@ PROBLEM_TAXONOMY: Final[Mapping[ErrorCode, ProblemSpec]] = MappingProxyType(
             type=f"{_TYPE_URI_PREFIX}extraction-timeout",
             title="Knowledge extraction exceeded its deadline",
             status=504,
+        ),
+        ErrorCode.INVALID_INPUT: ProblemSpec(
+            type=f"{_TYPE_URI_PREFIX}invalid-input",
+            title="The request input is invalid",
+            status=422,
         ),
     }
 )
@@ -320,3 +327,32 @@ class ExtractionTimeoutError(MemoryGraphError):
             instance=instance,
             context={"timeout_seconds": timeout_seconds},
         )
+
+
+class InvalidInputError(MemoryGraphError):
+    """Client-supplied input was rejected; ``errors`` lists each offending location.
+
+    Each error is ``{"loc": [...], "msg": str, "type": str}``. Rejected values are
+    never echoed back, so a problem body cannot leak what the client sent.
+    """
+
+    code: ClassVar[ErrorCode] = ErrorCode.INVALID_INPUT
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        errors: Iterable[Mapping[str, Any]] = (),
+        instance: str | None = None,
+    ) -> None:
+        self.errors = tuple(
+            {
+                "loc": [
+                    part if isinstance(part, int) else str(part) for part in error.get("loc", ())
+                ],
+                "msg": str(error.get("msg", "")),
+                "type": str(error.get("type", "value_error")),
+            }
+            for error in errors
+        )
+        super().__init__(detail, instance=instance, context={"errors": self.errors})

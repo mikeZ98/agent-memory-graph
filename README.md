@@ -5,9 +5,8 @@ a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts 
 entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
 them over **FastAPI**.
 
-> Status: extraction layer. Domain contracts, configuration, the async Neo4j / Qdrant
-> adapters, LLM graph extraction and embeddings exist; GraphRAG retrieval and the API
-> come next.
+> Status: service + HTTP API. Ingestion, GraphRAG retrieval and the FastAPI endpoints
+> work end to end; deployment packaging comes next.
 
 ## Domain model
 
@@ -46,6 +45,7 @@ Invariants enforced at construction time:
   | `StoreTimeoutError`           | `AMG_STORE_TIMEOUT`            | 504    |
   | `ExtractionFailedError`       | `AMG_EXTRACTION_FAILED`        | 502    |
   | `ExtractionTimeoutError`      | `AMG_EXTRACTION_TIMEOUT`       | 504    |
+  | `InvalidInputError`           | `AMG_INVALID_INPUT`            | 422    |
 
 ## Storage adapters
 
@@ -129,6 +129,60 @@ deterministic and dependency-free: signed feature hashing over word tokens, L2-n
 so texts that share words get similar vectors and seed search behaves plausibly in
 hermetic tests.
 
+## GraphRAG memory service
+
+`GraphMemoryService` (`services/retrieval.py`) composes the stores, the extractor and
+the embedder behind two narrow ports (`GraphStore`, `VectorStore`).
+
+- **`ingest(text)`** extracts, then embeds (before anything is written), then writes
+  the graph in one Neo4j transaction, then upserts the vectors. Neo4j and Qdrant can't
+  share a transaction, so the graph is written first: a vector never points at a
+  missing node. If the upsert then fails, the graph is complete but those entities
+  aren't seedable yet. Every step is idempotent (deterministic ids, `MERGE`, upserts),
+  so retrying the same ingest converges. Nothing is rolled back across stores, because
+  a delete could destroy graph state that earlier conversations share.
+- **`query(MemoryQuery)`** embeds the text, takes the best `top_k` seeds above
+  `score_threshold` (optionally restricted to `entity_types`), traverses
+  `traversal_depth` hops outward, and resolves the seeds and every path endpoint in one
+  read. It returns a `GraphContext` whose `summary` is bounded, markdown-escaped
+  markdown and whose `confidence` is the best seed's cosine similarity. It returns
+  `GraphContext.empty()` when nothing clears the threshold.
+- **`health()`** pings both stores concurrently and reports, rather than raises, failures.
+
+## HTTP API
+
+`create_app(service_factory)` builds the FastAPI app. Its lifespan starts the service
+(connection pools plus idempotent schema/collection setup) and closes it on shutdown.
+`build_memory_service(settings, llm=..., embedder=...)` composes the production service
+and refuses an embedder whose dimension differs from `AMG_EMBEDDING_DIM`.
+
+| Endpoint                | Body              | Success                              |
+| ----------------------- | ----------------- | ------------------------------------ |
+| `POST /v1/memory/ingest` | `{"text": str}`   | `200 {"graph": KnowledgeGraph, "report": ExtractionReport}` |
+| `POST /v1/memory/query`  | `MemoryQuery`     | `200 GraphContext`                   |
+| `GET /health`            |                   | `200` `{"status": "ok", "checks": {...}}`, or `503` with `"degraded"` |
+
+Every error is `application/problem+json` (RFC 9457):
+
+- `MemoryGraphError` subclasses use their taxonomy entry, with `instance` defaulting to
+  the request path.
+- Request validation failures become `AMG_INVALID_INPUT` (422), listing each `loc`,
+  `msg` and `type` but never the rejected value.
+- Framework errors (404, 405, 413) use `type: about:blank`.
+- Anything unexpected becomes a generic `AMG_INTERNAL_ERROR` (500), and the exception is
+  logged, never returned.
+
+Bodies over 1 MiB are refused with 413 before parsing: by `Content-Length`, or while
+streaming when there is none.
+
+```python
+from agent_memory_graph.api import build_memory_service, create_app
+from agent_memory_graph.config import Settings
+
+settings = Settings()
+app = create_app(lambda: build_memory_service(settings, llm=my_llm, embedder=my_embedder))
+```
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -156,7 +210,7 @@ uv sync               # creates .cache/venv with runtime + dev dependencies
 ruff check . && ruff format --check .
 mypy                  # strict mode, configured in pyproject.toml
 pytest                # hermetic: inet sockets blocked, no live services
-scripts/coverage-gate.sh   # domain 100 %; adapters, config, services >= 95 %
+scripts/coverage-gate.sh   # domain 100 %; adapters, config, services, api >= 95 %
 bandit -c pyproject.toml -r src
 ```
 
@@ -170,7 +224,7 @@ commands with `uv run`.
 | Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
 | Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
 | Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
-| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/` (line + branch) |
+| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/`, `api/` (line + branch) |
 | Security     | `bandit`                            | Static security scan of `src/`                                  |
 | `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
 | `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
@@ -186,7 +240,8 @@ on demand with `scripts/audit-attribution.sh [<rev-list args>]` and
 src/agent_memory_graph/   package (typed: ships py.typed)
   domain/                 pure schemas, retrieval contracts, error taxonomy
   adapters/               async Neo4j graph store and Qdrant vector store
-  services/               LLM graph extraction (instructor) and embeddings
+  services/               extraction (instructor), embeddings, GraphRAG retrieval
+  api/                    FastAPI app, endpoints, RFC 9457 handlers, body limit
   config.py               AMG_* settings
 tests/                    hermetic test suite (conftest scrubs service credentials)
 .githooks/                git hooks + shared policy
