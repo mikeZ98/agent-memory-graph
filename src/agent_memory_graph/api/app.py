@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Annotated, cast
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -19,10 +19,15 @@ from agent_memory_graph.api.schemas import (
     IngestResponse,
 )
 from agent_memory_graph.config import Settings
+from agent_memory_graph.domain.errors import ExtractionTimeoutError, StoreTimeoutError
 from agent_memory_graph.domain.query import GraphContext, MemoryQuery
+from agent_memory_graph.guardrails.graph_guard import InputGuard
+from agent_memory_graph.guardrails.limiter import CircuitBreaker, ConcurrencyLimiter
+from agent_memory_graph.guardrails.stores import GuardedGraphStore, GuardedLLM, GuardedVectorStore
+from agent_memory_graph.guardrails.telemetry import Telemetry
 from agent_memory_graph.services.embedder import EmbeddingService
 from agent_memory_graph.services.extractor import GraphExtractor, StructuredLLM
-from agent_memory_graph.services.retrieval import GraphMemoryService
+from agent_memory_graph.services.retrieval import GraphMemoryService, RetrievalPolicy
 
 __all__ = ["build_memory_service", "create_app", "router"]
 
@@ -31,21 +36,68 @@ type ServiceFactory = Callable[[], GraphMemoryService]
 _SERVICE_UNAVAILABLE = 503
 
 
+def _store_guards(
+    settings: Settings, store: str, telemetry: Telemetry
+) -> tuple[CircuitBreaker, ConcurrencyLimiter]:
+    breaker = CircuitBreaker(
+        store,
+        failure_threshold=settings.breaker_failure_threshold,
+        reset_timeout_seconds=settings.breaker_reset_seconds,
+    )
+    limiter = ConcurrencyLimiter(
+        store,
+        max_concurrency=settings.max_concurrent_store_operations,
+        queue_timeout_seconds=settings.queue_timeout_seconds,
+        on_queue_timeout=lambda waited: StoreTimeoutError(store, "queue", waited),
+    )
+    telemetry.register_breaker(breaker)
+    telemetry.register_limiter(limiter)
+    return breaker, limiter
+
+
 def build_memory_service(
     settings: Settings, *, llm: StructuredLLM, embedder: EmbeddingService
 ) -> GraphMemoryService:
-    """Compose the production service from settings and the chosen model providers."""
+    """Compose the production service: real adapters behind breakers and queues.
+
+    * each store gets a circuit breaker and a bounded queue (``AMG_STORE_TIMEOUT``
+      after ``AMG_QUEUE_TIMEOUT_SECONDS``);
+    * extraction calls share a smaller queue (``AMG_EXTRACTION_TIMEOUT`` on expiry);
+    * every breaker and queue reports into the service's telemetry (``GET /metrics``).
+    """
     if embedder.dimension != settings.embedding_dim:
         msg = (
             f"embedder produces {embedder.dimension}-d vectors but AMG_EMBEDDING_DIM is "
             f"{settings.embedding_dim}"
         )
         raise ValueError(msg)
+    telemetry = Telemetry()
+    graph_breaker, graph_limiter = _store_guards(settings, "neo4j", telemetry)
+    vector_breaker, vector_limiter = _store_guards(settings, "qdrant", telemetry)
+    llm_limiter = ConcurrencyLimiter(
+        "extraction",
+        max_concurrency=settings.max_concurrent_extractions,
+        queue_timeout_seconds=settings.queue_timeout_seconds,
+        on_queue_timeout=ExtractionTimeoutError,
+    )
+    telemetry.register_limiter(llm_limiter)
     return GraphMemoryService(
-        graph_store=Neo4jGraphStore.from_settings(settings),
-        vector_store=QdrantVectorStore.from_settings(settings),
-        extractor=GraphExtractor(llm),
+        graph_store=GuardedGraphStore(
+            Neo4jGraphStore.from_settings(settings), breaker=graph_breaker, limiter=graph_limiter
+        ),
+        vector_store=GuardedVectorStore(
+            QdrantVectorStore.from_settings(settings),
+            breaker=vector_breaker,
+            limiter=vector_limiter,
+        ),
+        extractor=GraphExtractor(GuardedLLM(llm, limiter=llm_limiter)),
         embedder=embedder,
+        telemetry=telemetry,
+        input_guard=InputGuard(mode=settings.input_guard_mode),
+        policy=RetrievalPolicy(
+            fallback_floor=settings.retrieval_fallback_floor,
+            max_fallback_steps=settings.retrieval_fallback_steps,
+        ),
     )
 
 
@@ -98,6 +150,12 @@ async def health(service: MemoryService) -> JSONResponse:
     return JSONResponse(
         body.model_dump(mode="json"), status_code=200 if report.ok else _SERVICE_UNAVAILABLE
     )
+
+
+@router.get("/metrics", summary="Counters, latencies, queue occupancy and circuit states")
+async def metrics(service: MemoryService) -> dict[str, Any]:
+    """In-process telemetry snapshot (JSON)."""
+    return service.telemetry.snapshot()
 
 
 def create_app(

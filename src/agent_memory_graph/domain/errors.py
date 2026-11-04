@@ -267,11 +267,21 @@ class StoreUnavailableError(MemoryGraphError):
 
     code: ClassVar[ErrorCode] = ErrorCode.STORE_UNAVAILABLE
 
-    def __init__(self, store: str, *, instance: str | None = None) -> None:
+    def __init__(
+        self,
+        store: str,
+        *,
+        retry_after_seconds: int | None = None,
+        instance: str | None = None,
+    ) -> None:
         self.store = store
-        super().__init__(
-            f"The {store} store is unavailable.", instance=instance, context={"store": store}
-        )
+        self.retry_after_seconds = retry_after_seconds
+        context: dict[str, Any] = {"store": store}
+        detail = f"The {store} store is unavailable."
+        if retry_after_seconds is not None:
+            context["retry_after_seconds"] = retry_after_seconds
+            detail = f"The {store} store is unavailable; retry in {retry_after_seconds}s."
+        super().__init__(detail, instance=instance, context=context)
 
 
 class StoreTimeoutError(MemoryGraphError):

@@ -125,3 +125,28 @@ def test_api_key_refused_over_plaintext_to_remote_hosts(url: str) -> None:
 
 def test_plaintext_without_api_key_is_allowed() -> None:
     assert settings(qdrant_url="http://qdrant:6333").qdrant_url == "http://qdrant:6333"
+
+
+def test_guardrail_defaults() -> None:
+    config = settings()
+    assert (config.max_concurrent_extractions, config.max_concurrent_store_operations) == (4, 32)
+    assert (config.queue_timeout_seconds, config.breaker_failure_threshold) == (2.0, 5)
+    assert config.breaker_reset_seconds == 30.0
+    assert config.input_guard_mode == "flag"
+    assert (config.retrieval_fallback_steps, config.retrieval_fallback_floor) == (3, 0.1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_concurrent_extractions", 0),
+        ("queue_timeout_seconds", 0),
+        ("breaker_failure_threshold", 0),
+        ("breaker_reset_seconds", float("nan")),
+        ("input_guard_mode", "block"),
+        ("retrieval_fallback_floor", 1.5),
+    ],
+)
+def test_invalid_guardrail_settings(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        settings(**{field: value})

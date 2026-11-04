@@ -6,7 +6,7 @@ what a test or container sees is exactly what it was given. Secrets are held as
 """
 
 import ipaddress
-from typing import Annotated, Final, Self
+from typing import Annotated, Final, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import AfterValidator, Field, SecretStr, model_validator
@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     default_timeout_seconds: Annotated[float, Field(gt=0.0, le=300.0, allow_inf_nan=False)] = 10.0
     neo4j_max_pool_size: Annotated[int, Field(ge=1, le=1000)] = 50
     qdrant_upsert_batch_size: Annotated[int, Field(ge=1, le=10_000)] = 256
+
+    # Guardrails
+    max_concurrent_extractions: Annotated[int, Field(ge=1, le=256)] = 4
+    max_concurrent_store_operations: Annotated[int, Field(ge=1, le=1000)] = 32
+    queue_timeout_seconds: Annotated[float, Field(gt=0.0, le=60.0, allow_inf_nan=False)] = 2.0
+    breaker_failure_threshold: Annotated[int, Field(ge=1, le=100)] = 5
+    breaker_reset_seconds: Annotated[float, Field(gt=0.0, le=600.0, allow_inf_nan=False)] = 30.0
+    input_guard_mode: Literal["flag", "reject"] = "flag"
+    retrieval_fallback_steps: Annotated[int, Field(ge=0, le=10)] = 3
+    retrieval_fallback_floor: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 0.1
 
     @model_validator(mode="after")
     def _no_api_key_over_plaintext(self) -> Self:

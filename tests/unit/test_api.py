@@ -20,10 +20,13 @@ from agent_memory_graph.domain import (
     EntityType,
     ExtractionFailedError,
     MemoryGraphError,
+    StoreTimeoutError,
     StoreUnavailableError,
     VectorSearchTimeoutError,
     make_entity_id,
 )
+from agent_memory_graph.guardrails import CircuitOpenError
+from agent_memory_graph.guardrails.stores import GuardedGraphStore, GuardedLLM, GuardedVectorStore
 from agent_memory_graph.services import GraphExtractor, MockEmbeddingService
 from agent_memory_graph.services.retrieval import GraphMemoryService
 from tests.unit.doubles import InMemoryGraphStore, InMemoryVectorStore, ScriptedLLM
@@ -110,8 +113,16 @@ async def test_lifespan_starts_and_closes_the_service() -> None:
 def test_build_memory_service_composes_real_adapters_offline() -> None:
     settings = Settings(neo4j_password=SecretStr("pw"), embedding_dim=16)
     service = build_memory_service(settings, llm=ScriptedLLM(), embedder=MockEmbeddingService(16))
-    assert isinstance(service._graph, Neo4jGraphStore)
-    assert isinstance(service._vectors, QdrantVectorStore)
+    assert isinstance(service._graph, GuardedGraphStore)
+    assert isinstance(service._graph.inner, Neo4jGraphStore)
+    assert isinstance(service._vectors, GuardedVectorStore)
+    assert isinstance(service._vectors.inner, QdrantVectorStore)
+    assert isinstance(service._extractor._llm, GuardedLLM)
+    snapshot = service.telemetry.snapshot()
+    assert set(snapshot["circuits"]) == {"neo4j", "qdrant"}
+    assert set(snapshot["limiters"]) == {"extraction", "neo4j", "qdrant"}
+    assert snapshot["limiters"]["neo4j"]["capacity"] == settings.max_concurrent_store_operations
+    assert snapshot["limiters"]["extraction"]["capacity"] == settings.max_concurrent_extractions
 
 
 def test_build_memory_service_rejects_mismatched_embedding_dimensions() -> None:
@@ -405,7 +416,12 @@ class TestHealthAndFramework:
         query_responses = spec["paths"]["/v1/memory/query"]["post"]["responses"]
         assert {"200", "422", "500", "502", "503", "504"} <= set(query_responses)
         assert PROBLEM in query_responses["504"]["content"]
-        assert set(spec["paths"]) == {"/v1/memory/ingest", "/v1/memory/query", "/health"}
+        assert set(spec["paths"]) == {
+            "/v1/memory/ingest",
+            "/v1/memory/query",
+            "/health",
+            "/metrics",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +521,41 @@ async def test_client_disconnect_while_streaming_is_passed_through() -> None:
         {"type": "http", "path": "/x", "headers": []}, receive, send
     )
     assert [m["type"] for m in messages] == ["http.request", "http.disconnect"]
+
+
+class TestGuardrailEndpoints:
+    async def test_metrics_reflect_traffic(self, api: Api) -> None:
+        await api.client.post("/v1/memory/ingest", json={"text": TEXT})
+        await api.client.post("/v1/memory/query", json={"text": "memory service"})
+        response = await api.client.get("/metrics")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["counters"]["ingest_requests"] == 1
+        assert body["counters"]["query_requests"] == 1
+        assert body["counters"]["entities_indexed"] == 2
+        assert body["latency"]["query"]["count"] == 1
+        assert set(body) == {"uptime_seconds", "counters", "latency", "limiters", "circuits"}
+
+    async def test_open_circuit_is_503_with_retry_after(self, api: Api) -> None:
+        api.vectors.errors["search_scored"] = CircuitOpenError("qdrant", retry_after_seconds=17)
+        response = await api.client.post("/v1/memory/query", json={"text": "neo4j"})
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "17"
+        assert response.json() == {
+            "type": f"{URN}store-unavailable",
+            "title": "A backing store is unavailable",
+            "status": 503,
+            "detail": "The qdrant store is unavailable; retry in 17s.",
+            "instance": "/v1/memory/query",
+            "code": "AMG_STORE_UNAVAILABLE",
+            "context": {"store": "qdrant", "retry_after_seconds": 17},
+        }
+
+    async def test_queue_timeout_is_504_store_timeout(self, api: Api) -> None:
+        api.graph.errors["traverse_neighborhood"] = StoreTimeoutError("neo4j", "queue", 2.0)
+        await api.client.post("/v1/memory/ingest", json={"text": TEXT})
+        response = await api.client.post("/v1/memory/query", json={"text": "memory service"})
+        assert response.status_code == 504
+        assert response.json()["code"] == "AMG_STORE_TIMEOUT"
+        assert response.json()["context"]["operation"] == "queue"
+        assert "retry-after" not in response.headers

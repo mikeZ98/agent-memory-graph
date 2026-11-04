@@ -5,8 +5,9 @@ a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts 
 entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
 them over **FastAPI**.
 
-> Status: service + HTTP API. Ingestion, GraphRAG retrieval and the FastAPI endpoints
-> work end to end; deployment packaging comes next.
+> Status: service + HTTP API with guardrails. Ingestion, GraphRAG retrieval, the
+> FastAPI endpoints, concurrency limits, circuit breakers and telemetry work end to end;
+> deployment packaging comes next.
 
 ## Domain model
 
@@ -161,6 +162,7 @@ and refuses an embedder whose dimension differs from `AMG_EMBEDDING_DIM`.
 | `POST /v1/memory/ingest` | `{"text": str}`   | `200 {"graph": KnowledgeGraph, "report": ExtractionReport}` |
 | `POST /v1/memory/query`  | `MemoryQuery`     | `200 GraphContext`                   |
 | `GET /health`            |                   | `200` `{"status": "ok", "checks": {...}}`, or `503` with `"degraded"` |
+| `GET /metrics`           |                   | `200` telemetry snapshot (JSON)      |
 
 Every error is `application/problem+json` (RFC 9457):
 
@@ -183,6 +185,20 @@ settings = Settings()
 app = create_app(lambda: build_memory_service(settings, llm=my_llm, embedder=my_embedder))
 ```
 
+## Guardrails
+
+`agent_memory_graph.guardrails` keeps one slow or hostile dependency from taking the
+service down. `build_memory_service` wires all of it from settings.
+
+| Guard | Behaviour |
+| ----- | --------- |
+| **Bounded queues** (`ConcurrencyLimiter`) | Each store allows at most `AMG_MAX_CONCURRENT_STORE_OPERATIONS` concurrent operations, and extraction allows `AMG_MAX_CONCURRENT_EXTRACTIONS`. A caller that can't get a permit within `AMG_QUEUE_TIMEOUT_SECONDS` gets `AMG_STORE_TIMEOUT` (`operation: "queue"`) or `AMG_EXTRACTION_TIMEOUT` (504) instead of piling up. |
+| **Circuit breakers** (`CircuitBreaker`) | A store's breaker opens after `AMG_BREAKER_FAILURE_THRESHOLD` consecutive *store* failures (unavailable or timed out; rejected requests don't count). While open, calls fail fast with 503 and `Retry-After` and never touch the store or the queue. After `AMG_BREAKER_RESET_SECONDS` one probe is let through; success closes the breaker, failure reopens it. Queue timeouts never trip a breaker, since they signal local overload, not store health. |
+| **Input guard** (`InputGuard`) | Text is screened before extraction. Forged structure (chat-template tokens such as `<\|im_start\|>`, `System:` role headers, fake `<conversation>`, `[INST]` and `<<SYS>>` delimiters) is defanged in place. Instruction-override phrasing is flagged but kept. `AMG_INPUT_GUARD_MODE=reject` refuses any finding with 422, without echoing the text. |
+| **Traversal guard** (`TraversalGuard`) | Traversal results are bounded before synthesis: at most 500 edges per seed, 100 out-edges per node (hubs) and 100 cycle-closing edges. Edges are kept shallowest and strongest first, and anything reachable only through a pruned edge is dropped, so every path stays connected to a seed. |
+| **Adaptive fallback** (`RetrievalPolicy`) | If the requested `score_threshold` finds no seeds, it's retried at ×0.8 per step, for up to `AMG_RETRIEVAL_FALLBACK_STEPS` extra searches and never below `AMG_RETRIEVAL_FALLBACK_FLOOR`. `confidence` then reflects the weaker match. |
+| **Telemetry** (`Telemetry`) | Request and failure counters, latency (count, sum, min, max, mean, p50/p95/p99, cumulative buckets), entities and relations indexed, pruned candidates and hops, suspicious inputs, fallbacks, and live queue occupancy and circuit states, served at `GET /metrics`. |
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -200,6 +216,14 @@ Settings are read from `AMG_*` environment variables only; `.env` files are neve
 | `AMG_QDRANT_UPSERT_BATCH_SIZE` | `256`                    |                                        |
 | `AMG_EMBEDDING_DIM`            | `384`                    | 1 to 8192                              |
 | `AMG_DEFAULT_TIMEOUT_SECONDS`  | `10.0`                   | per operation, client and server side  |
+| `AMG_MAX_CONCURRENT_EXTRACTIONS` | `4`                    | concurrent LLM extraction calls        |
+| `AMG_MAX_CONCURRENT_STORE_OPERATIONS` | `32`              | per store                              |
+| `AMG_QUEUE_TIMEOUT_SECONDS`    | `2.0`                    | max wait for a permit                  |
+| `AMG_BREAKER_FAILURE_THRESHOLD` | `5`                     | consecutive store failures to trip     |
+| `AMG_BREAKER_RESET_SECONDS`    | `30.0`                   | open time before a half-open probe     |
+| `AMG_INPUT_GUARD_MODE`         | `flag`                   | `flag` or `reject`                     |
+| `AMG_RETRIEVAL_FALLBACK_STEPS` | `3`                      | 0 disables the fallback                |
+| `AMG_RETRIEVAL_FALLBACK_FLOOR` | `0.1`                    | lowest threshold a fallback may use    |
 
 ## Quickstart
 
@@ -210,7 +234,7 @@ uv sync               # creates .cache/venv with runtime + dev dependencies
 ruff check . && ruff format --check .
 mypy                  # strict mode, configured in pyproject.toml
 pytest                # hermetic: inet sockets blocked, no live services
-scripts/coverage-gate.sh   # domain 100 %; adapters, config, services, api >= 95 %
+scripts/coverage-gate.sh   # domain 100 %; adapters, config, services, api, guardrails >= 95 %
 bandit -c pyproject.toml -r src
 ```
 
@@ -224,7 +248,7 @@ commands with `uv run`.
 | Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
 | Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
 | Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
-| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/`, `api/` (line + branch) |
+| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/`, `api/`, `guardrails/` (line + branch) |
 | Security     | `bandit`                            | Static security scan of `src/`                                  |
 | `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
 | `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
@@ -242,6 +266,7 @@ src/agent_memory_graph/   package (typed: ships py.typed)
   adapters/               async Neo4j graph store and Qdrant vector store
   services/               extraction (instructor), embeddings, GraphRAG retrieval
   api/                    FastAPI app, endpoints, RFC 9457 handlers, body limit
+  guardrails/             limiters, circuit breakers, input/traversal guards, telemetry
   config.py               AMG_* settings
 tests/                    hermetic test suite (conftest scrubs service credentials)
 .githooks/                git hooks + shared policy

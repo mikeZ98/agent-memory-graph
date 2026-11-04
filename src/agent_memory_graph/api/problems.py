@@ -65,7 +65,9 @@ def _render(error: MemoryGraphError, request: Request) -> JSONResponse:
                      error.detail, exc_info=error)  # fmt: skip
     else:
         logger.info("%s %s → %s", request.method, request.url.path, error.code.value)
-    return problem_response(problem.to_json_dict(), problem.status)
+    retry_after = problem.context.get("retry_after_seconds")
+    headers = {"Retry-After": str(retry_after)} if isinstance(retry_after, int) else None
+    return problem_response(problem.to_json_dict(), problem.status, headers=headers)
 
 
 async def _memory_error_handler(request: Request, exc: Exception) -> JSONResponse:

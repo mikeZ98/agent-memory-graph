@@ -727,6 +727,13 @@ class TestDomainErrors:
             {"store": "neo4j"},
         )
 
+    def test_store_unavailable_error_with_retry_hint(self) -> None:
+        error = StoreUnavailableError("qdrant", retry_after_seconds=12)
+        assert error.retry_after_seconds == 12
+        problem = error.to_problem()
+        assert problem.detail == "The qdrant store is unavailable; retry in 12s."
+        assert problem.context == {"store": "qdrant", "retry_after_seconds": 12}
+
     def test_store_timeout_error(self) -> None:
         error = StoreTimeoutError("qdrant", "upsert_entities", 1.5)
         assert (error.store, error.operation, error.timeout_seconds) == (

@@ -13,6 +13,7 @@ resolve every entity on the paths in one read → render a markdown summary.
 """
 
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from agent_memory_graph.domain.query import (
     GraphHop,
     MemoryQuery,
 )
+from agent_memory_graph.guardrails.graph_guard import InputGuard, TraversalGuard
+from agent_memory_graph.guardrails.telemetry import Telemetry
 from agent_memory_graph.services.embedder import EmbeddingService
 from agent_memory_graph.services.extractor import ExtractionReport, GraphExtractor
 
@@ -34,12 +37,58 @@ __all__ = [
     "GraphMemoryService",
     "GraphStore",
     "HealthReport",
+    "RetrievalPolicy",
     "VectorStore",
+    "fallback_thresholds",
     "render_summary",
 ]
 
+logger = logging.getLogger(__name__)
+
 MAX_SUMMARY_DESCRIPTION_CHARS: Final = 280
 _MARKDOWN_SPECIAL_RE: Final = re.compile(r"([\\`*_\[\]<>#|~])")
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalPolicy:
+    """Adaptive fallback when the requested threshold finds no seeds.
+
+    Each retry multiplies the threshold by ``fallback_factor`` (never going below
+    ``fallback_floor``), for at most ``max_fallback_steps`` extra vector searches.
+    ``max_fallback_steps=0`` disables the fallback.
+    """
+
+    fallback_factor: float = 0.8
+    fallback_floor: float = 0.1
+    max_fallback_steps: int = 3
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.fallback_factor < 1.0:
+            msg = "fallback_factor must be in (0, 1)"
+            raise ValueError(msg)
+        if not 0.0 <= self.fallback_floor <= 1.0:
+            msg = "fallback_floor must be in [0, 1]"
+            raise ValueError(msg)
+        if self.max_fallback_steps < 0:
+            msg = "max_fallback_steps must be >= 0"
+            raise ValueError(msg)
+
+
+def fallback_thresholds(threshold: float, policy: RetrievalPolicy) -> tuple[float, ...]:
+    """Return the thresholds to try in order: the requested one, then relaxed ones.
+
+    A threshold already at or below the floor is never relaxed (the caller asked for
+    exactly that), and the sequence stops as soon as it reaches the floor.
+    """
+    thresholds = [threshold]
+    current = threshold
+    for _ in range(policy.max_fallback_steps):
+        if current <= policy.fallback_floor:
+            break
+        current = max(policy.fallback_floor, round(current * policy.fallback_factor, 6))
+        thresholds.append(current)
+    return tuple(thresholds)
+
 
 type CheckStatus = Literal["ok", "unavailable"]
 
@@ -185,7 +234,12 @@ def render_summary(
 # Service
 # ---------------------------------------------------------------------------
 class GraphMemoryService:
-    """Orchestrates extraction, embedding, the graph store and the vector store."""
+    """Orchestrates extraction, embedding, the graph store and the vector store.
+
+    Guardrails are on by default: ingested text is screened by ``input_guard``,
+    traversal results are bounded by ``traversal_guard`` before synthesis, empty
+    retrievals are retried per ``policy``, and everything is recorded in ``telemetry``.
+    """
 
     def __init__(
         self,
@@ -194,11 +248,19 @@ class GraphMemoryService:
         vector_store: VectorStore,
         extractor: GraphExtractor,
         embedder: EmbeddingService,
+        telemetry: Telemetry | None = None,
+        input_guard: InputGuard | None = None,
+        traversal_guard: TraversalGuard | None = None,
+        policy: RetrievalPolicy | None = None,
     ) -> None:
         self._graph = graph_store
         self._vectors = vector_store
         self._extractor = extractor
         self._embedder = embedder
+        self.telemetry = telemetry or Telemetry()
+        self._input_guard = input_guard or InputGuard()
+        self._traversal_guard = traversal_guard or TraversalGuard()
+        self._policy = policy or RetrievalPolicy()
 
     # -- lifecycle ----------------------------------------------------------
     async def start(self, *, ensure_schema: bool = True) -> None:
@@ -241,35 +303,79 @@ class GraphMemoryService:
 
     # -- ingestion ----------------------------------------------------------
     async def ingest(self, text: str) -> tuple[KnowledgeGraph, ExtractionReport]:
-        """Extract a graph from ``text``, store it, and index its entities.
+        """Screen, extract, embed and store ``text``; return the graph and report.
 
         Embeddings are computed before anything is written, so an embedding failure
         leaves both stores untouched. The returned graph carries no embeddings; they
         live in the vector store.
         """
-        graph, report = await self._extractor.extract(text)
-        if not graph.entities:
+        with self.telemetry.track("ingest"):
+            scan = self._input_guard.check(text)
+            if scan.suspicious:
+                self.telemetry.increment("suspicious_inputs")
+                logger.warning(
+                    "ingest text contains prompt-injection markers: %s",
+                    ", ".join(scan.kinds),
+                )
+            graph, report = await self._extractor.extract(scan.text)
+            self.telemetry.increment("candidates_pruned", report.pruned)
+            if not graph.entities:
+                return graph, report
+            embedded = await self._embedder.embed_entities(graph.entities)
+            await self._graph.ingest_graph(graph)
+            await self._vectors.upsert_entities(embedded)
+            self.telemetry.increment("entities_indexed", len(graph.entities))
+            self.telemetry.increment("relations_indexed", len(graph.relations))
             return graph, report
-        embedded = await self._embedder.embed_entities(graph.entities)
-        await self._graph.ingest_graph(graph)
-        await self._vectors.upsert_entities(embedded)
-        return graph, report
 
     # -- retrieval ----------------------------------------------------------
+    async def _search_seeds(
+        self, vector: Sequence[float], query: MemoryQuery
+    ) -> list[tuple[str, float]]:
+        thresholds = fallback_thresholds(query.score_threshold, self._policy)
+        for attempt, threshold in enumerate(thresholds):
+            if attempt:
+                self.telemetry.increment("query_fallbacks")
+            scored = await self._vectors.search_scored(
+                vector, query.top_k, threshold, query.entity_types
+            )
+            if scored:
+                if attempt:
+                    self.telemetry.increment("fallback_hits")
+                    logger.info(
+                        "fallback threshold %.3f found %d seed(s) (requested %.3f)",
+                        threshold, len(scored), query.score_threshold,
+                    )  # fmt: skip
+                return scored
+        return []
+
     async def query(self, query: MemoryQuery) -> GraphContext:
         """Answer ``query`` with seed entities, their neighbourhood and a summary.
 
-        Returns :meth:`GraphContext.empty` when no stored entity clears the
-        similarity threshold. ``confidence`` is the best seed's cosine similarity.
+        When the requested ``score_threshold`` finds nothing, the threshold is relaxed
+        per the :class:`RetrievalPolicy` before giving up; ``confidence`` (the best
+        seed's cosine similarity) then reflects the weaker match. Returns
+        :meth:`GraphContext.empty` when even the fallback finds nothing.
         """
+        with self.telemetry.track("query"):
+            context = await self._query(query)
+            if not context.seed_entities:
+                self.telemetry.increment("empty_contexts")
+            return context
+
+    async def _query(self, query: MemoryQuery) -> GraphContext:
         vector = await self._embedder.embed_text(query.text)
-        scored = await self._vectors.search_scored(
-            vector, query.top_k, query.score_threshold, query.entity_types
-        )
+        scored = await self._search_seeds(vector, query)
         if not scored:
             return GraphContext.empty()
         seed_ids = [entity_id for entity_id, _ in scored]
-        hops = await self._graph.traverse_neighborhood(seed_ids, depth=query.traversal_depth)
+        raw_hops = await self._graph.traverse_neighborhood(seed_ids, depth=query.traversal_depth)
+        hops, containment = self._traversal_guard.contain(seed_ids, raw_hops)
+        if containment.pruned:
+            self.telemetry.increment("traversal_hops_pruned", containment.pruned)
+            logger.info(
+                "traversal containment pruned %d hop(s): %s", containment.pruned, containment
+            )
         endpoint_ids = [eid for hop in hops for eid in (hop.source_id, hop.target_id)]
         known = {e.id: e for e in await self._graph.fetch_entities([*seed_ids, *endpoint_ids])}
         seeds = tuple(known[eid] for eid in seed_ids if eid in known)
