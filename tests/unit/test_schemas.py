@@ -16,6 +16,8 @@ from agent_memory_graph.domain import (
     EntityIntegrityError,
     EntityType,
     ErrorCode,
+    ExtractionFailedError,
+    ExtractionTimeoutError,
     GraphContext,
     GraphHop,
     KnowledgeGraph,
@@ -679,6 +681,22 @@ class TestDomainErrors:
         problem = error.to_problem()
         assert (problem.detail, problem.context) == (detail, context)
 
+    @pytest.mark.parametrize(
+        ("attempts", "context"),
+        [(None, {"reason": "bad output"}), (3, {"reason": "bad output", "attempts": 3})],
+    )
+    def test_extraction_failed_error(self, attempts: int | None, context: dict[str, Any]) -> None:
+        error = ExtractionFailedError("bad output", attempts=attempts)
+        assert (error.reason, error.attempts, error.status) == ("bad output", attempts, 502)
+        problem = error.to_problem()
+        assert problem.detail == "Knowledge extraction failed: bad output."
+        assert problem.context == context
+
+    def test_extraction_timeout_error(self) -> None:
+        error = ExtractionTimeoutError(30.0)
+        assert (error.timeout_seconds, error.status) == (30.0, 504)
+        assert error.to_problem().detail == "Knowledge extraction did not complete within 30s."
+
     def test_store_unavailable_error(self) -> None:
         error = StoreUnavailableError("neo4j")
         assert (error.store, error.status) == ("neo4j", 503)
@@ -714,6 +732,8 @@ class TestDomainErrors:
             VectorSearchTimeoutError,
             StoreUnavailableError,
             StoreTimeoutError,
+            ExtractionFailedError,
+            ExtractionTimeoutError,
         ],
     )
     def test_each_error_has_its_own_code(self, error_type: type[MemoryGraphError]) -> None:

@@ -2,6 +2,7 @@
 # Enforce per-layer coverage floors (line + branch):
 #   * domain layer (pure contracts):        100 %
 #   * adapters + configuration (I/O edge):  >= 95 %
+#   * services (extraction, embedding):    >= 95 %
 #
 # Run after the test suite has produced coverage data (pytest runs with --cov);
 # the overall floor is enforced by pytest-cov itself (fail_under in pyproject.toml).
@@ -23,3 +24,4 @@ gate() {
 
 gate 100 "domain" "src/agent_memory_graph/domain/*"
 gate 95 "adapters + config" "src/agent_memory_graph/adapters/*" "src/agent_memory_graph/config.py"
+gate 95 "services" "src/agent_memory_graph/services/*"

@@ -5,8 +5,9 @@ a knowledge graph in **Neo4j** and as vector embeddings in **Qdrant**, extracts 
 entities and relations with **instructor** on top of **Pydantic v2** contracts, and serves
 them over **FastAPI**.
 
-> Status: storage layer. Domain contracts, configuration and the async Neo4j / Qdrant
-> adapters exist; the retrieval service and the API come next.
+> Status: extraction layer. Domain contracts, configuration, the async Neo4j / Qdrant
+> adapters, LLM graph extraction and embeddings exist; GraphRAG retrieval and the API
+> come next.
 
 ## Domain model
 
@@ -43,6 +44,8 @@ Invariants enforced at construction time:
   | `VectorSearchTimeoutError`    | `AMG_VECTOR_SEARCH_TIMEOUT`    | 504    |
   | `StoreUnavailableError`       | `AMG_STORE_UNAVAILABLE`        | 503    |
   | `StoreTimeoutError`           | `AMG_STORE_TIMEOUT`            | 504    |
+  | `ExtractionFailedError`       | `AMG_EXTRACTION_FAILED`        | 502    |
+  | `ExtractionTimeoutError`      | `AMG_EXTRACTION_TIMEOUT`       | 504    |
 
 ## Storage adapters
 
@@ -85,6 +88,47 @@ or `connect()` / `close()`, both idempotent), and every driver failure leaves it
 | Neo4j uniqueness constraint violated / relation count mismatch | `EntityIntegrityError` (422) |
 | Rejected credentials / API key, anything else      | `MemoryGraphError` (500), no server message leaked |
 
+## Extraction and embedding services
+
+`agent_memory_graph.services` turns conversation text into memory. Both services depend
+on narrow ports, so the LLM and embedding providers are chosen where the app is
+assembled, not inside the library.
+
+**`GraphExtractor.extract_triplets(text) -> KnowledgeGraph`** (`extract()` also returns an
+`ExtractionReport` of what was pruned)
+
+1. *Guard.* The text is NFKC-normalised and stripped of control, zero-width and
+   bidi-override characters. Input over `max_input_chars` (32 000) raises `ValueError`
+   instead of being truncated, and empty input returns an empty graph without calling
+   the model. Look-alikes of the `<conversation>` delimiter are neutralised, and the
+   system prompt treats the text as data, never as instructions.
+2. *Extract.* A `StructuredLLM` returns a lenient `GraphExtraction` (entities by name,
+   relations by endpoint name). `InstructorStructuredLLM` wraps any
+   `instructor.AsyncInstructor`. instructor validates the tool call and re-asks the model
+   on schema or JSON errors; exhausting the retries raises `ExtractionFailedError`.
+3. *Convert.* Ids come from `make_entity_id(name, type)` and are never taken from the
+   model. Predicates are normalised to `SCREAMING_SNAKE_CASE` and unknown entity types
+   become `MISC`. Unprintable or oversized entities, invalid predicates, dangling
+   endpoints, self-loops and duplicate triplets are pruned and counted, and the
+   highest-confidence duplicate is kept. The result always satisfies `KnowledgeGraph`
+   integrity.
+
+```python
+import instructor
+from agent_memory_graph.services import GraphExtractor, InstructorStructuredLLM
+
+llm = InstructorStructuredLLM(
+    instructor.from_provider("<provider>/<model>", async_client=True), model="<model>"
+)
+graph = await GraphExtractor(llm).extract_triplets(conversation_text)
+```
+
+**`EmbeddingService`** (`dimension`, `embed_text`, `embed_entities`) embeds entities from
+`"<name> (<type>): <description>"`. `MockEmbeddingService(settings.embedding_dim)` is
+deterministic and dependency-free: signed feature hashing over word tokens, L2-normalised,
+so texts that share words get similar vectors and seed search behaves plausibly in
+hermetic tests.
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -112,7 +156,7 @@ uv sync               # creates .cache/venv with runtime + dev dependencies
 ruff check . && ruff format --check .
 mypy                  # strict mode, configured in pyproject.toml
 pytest                # hermetic: inet sockets blocked, no live services
-scripts/coverage-gate.sh   # domain 100 %, adapters + config >= 95 % (line + branch)
+scripts/coverage-gate.sh   # domain 100 %; adapters, config, services >= 95 %
 bandit -c pyproject.toml -r src
 ```
 
@@ -126,7 +170,7 @@ commands with `uv run`.
 | Lint/format  | `ruff` (line length 100)            | Broad strict rule set, including annotations and docstrings     |
 | Types        | `mypy --strict` + pydantic plugin   | Fully typed `src/` and `tests/`                                 |
 | Tests        | `pytest`, `pytest-asyncio`, `pytest-socket` | Network-free runs, warnings as errors, ≥ 90 % branch coverage overall |
-| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/` + `config.py` (line + branch) |
+| Layer cov.   | `scripts/coverage-gate.sh`          | 100 % on `domain/`, ≥ 95 % on `adapters/`, `config.py`, `services/` (line + branch) |
 | Security     | `bandit`                            | Static security scan of `src/`                                  |
 | `pre-commit` | `.githooks/pre-commit`              | Committer identity, no cache/secret files, no machine paths or credentials, ruff on staged files |
 | `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
@@ -142,6 +186,7 @@ on demand with `scripts/audit-attribution.sh [<rev-list args>]` and
 src/agent_memory_graph/   package (typed: ships py.typed)
   domain/                 pure schemas, retrieval contracts, error taxonomy
   adapters/               async Neo4j graph store and Qdrant vector store
+  services/               LLM graph extraction (instructor) and embeddings
   config.py               AMG_* settings
 tests/                    hermetic test suite (conftest scrubs service credentials)
 .githooks/                git hooks + shared policy

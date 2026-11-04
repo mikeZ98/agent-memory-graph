@@ -21,6 +21,8 @@ __all__ = [
     "PROBLEM_TAXONOMY",
     "EntityIntegrityError",
     "ErrorCode",
+    "ExtractionFailedError",
+    "ExtractionTimeoutError",
     "MemoryGraphError",
     "MemoryProblemDetails",
     "ProblemSpec",
@@ -46,6 +48,8 @@ class ErrorCode(StrEnum):
     VECTOR_SEARCH_TIMEOUT = "AMG_VECTOR_SEARCH_TIMEOUT"
     STORE_UNAVAILABLE = "AMG_STORE_UNAVAILABLE"
     STORE_TIMEOUT = "AMG_STORE_TIMEOUT"
+    EXTRACTION_FAILED = "AMG_EXTRACTION_FAILED"
+    EXTRACTION_TIMEOUT = "AMG_EXTRACTION_TIMEOUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,16 @@ PROBLEM_TAXONOMY: Final[Mapping[ErrorCode, ProblemSpec]] = MappingProxyType(
         ErrorCode.STORE_TIMEOUT: ProblemSpec(
             type=f"{_TYPE_URI_PREFIX}store-timeout",
             title="A backing store operation exceeded its deadline",
+            status=504,
+        ),
+        ErrorCode.EXTRACTION_FAILED: ProblemSpec(
+            type=f"{_TYPE_URI_PREFIX}extraction-failed",
+            title="The language model did not return a usable extraction",
+            status=502,
+        ),
+        ErrorCode.EXTRACTION_TIMEOUT: ProblemSpec(
+            type=f"{_TYPE_URI_PREFIX}extraction-timeout",
+            title="Knowledge extraction exceeded its deadline",
             status=504,
         ),
     }
@@ -273,4 +287,36 @@ class StoreTimeoutError(MemoryGraphError):
             f"The {store} {operation} operation did not complete within {timeout_seconds:g}s.",
             instance=instance,
             context={"store": store, "operation": operation, "timeout_seconds": timeout_seconds},
+        )
+
+
+class ExtractionFailedError(MemoryGraphError):
+    """The extraction model failed, or kept returning output that fails the schema."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.EXTRACTION_FAILED
+
+    def __init__(
+        self, reason: str, *, attempts: int | None = None, instance: str | None = None
+    ) -> None:
+        self.reason = reason
+        self.attempts = attempts
+        context: dict[str, Any] = {"reason": reason}
+        if attempts is not None:
+            context["attempts"] = attempts
+        super().__init__(
+            f"Knowledge extraction failed: {reason}.", instance=instance, context=context
+        )
+
+
+class ExtractionTimeoutError(MemoryGraphError):
+    """The extraction model did not answer within the deadline."""
+
+    code: ClassVar[ErrorCode] = ErrorCode.EXTRACTION_TIMEOUT
+
+    def __init__(self, timeout_seconds: float, *, instance: str | None = None) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"Knowledge extraction did not complete within {timeout_seconds:g}s.",
+            instance=instance,
+            context={"timeout_seconds": timeout_seconds},
         )
