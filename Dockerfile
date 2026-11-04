@@ -74,8 +74,8 @@ LABEL org.opencontainers.image.title="agent-memory-graph" \
 # 1. static unprivileged identity; 2. strip setuid/setgid bits; 3. remove pip and the
 #    apt/dpkg toolchain (with their state) so nothing can be installed at runtime.
 RUN set -eu; \
-    groupadd --system --gid 10001 appuser; \
-    useradd --system --uid 10001 --gid 10001 --no-create-home \
+    groupadd --gid 10001 appuser; \
+    useradd --uid 10001 --gid 10001 --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin appuser; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +; \
     rm -rf /usr/local/lib/python3.12/site-packages/pip \
