@@ -35,12 +35,15 @@ WORKDIR /src
 
 # Dependencies first (cached layer), then the project itself; never editable.
 COPY pyproject.toml uv.lock README.md LICENSE ./
+# ${extras} is a deliberately word-split list of "--extra NAME" flags.
+# hadolint ignore=SC2086
 RUN set -eu; \
     extras=""; \
     for extra in ${AMG_EXTRAS}; do extras="${extras} --extra ${extra}"; done; \
     uv sync --no-dev --no-install-project --no-editable ${extras}
 
 COPY src ./src
+# hadolint ignore=SC2086
 RUN set -eu; \
     extras=""; \
     for extra in ${AMG_EXTRAS}; do extras="${extras} --extra ${extra}"; done; \

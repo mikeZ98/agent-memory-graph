@@ -288,6 +288,30 @@ docker compose up -d --wait          # API on 127.0.0.1:8000
 The offline mode runs in the test suite (`tests/unit/test_container_policy.py`), which
 also mutates the shipped files to prove that every rule fires.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests. Every job uses
+`ubuntu-24.04` and a timeout, the workflow token is read-only (`contents: read`), and
+checkouts never persist credentials. Every third-party action is pinned by its full
+40-character commit SHA, with the release tag as a comment. Each SHA was checked
+against its tag through the GitHub API when it was pinned. The Trivy binary itself is
+pinned too (`v0.76.1`). Caches stay under `./.cache/` exactly as locally.
+
+| Job | Gates |
+| --- | ----- |
+| `attribution-audit` | Full-history checkout, then `audit-attribution.sh` over the pushed or PR range and over the whole history, then `audit-hygiene.sh` |
+| `code-quality` (needs the audit) | `uv sync --locked` (Python 3.12, uv cache), workflow policy, `ruff check`, `ruff format --check`, `mypy`, `bandit`, `HYPOTHESIS_PROFILE=ci pytest` (including the e2e subprocess and container policy tests), `coverage-gate.sh`, `audit-cache-leaks.sh` |
+| `container-security` (needs the audit) | Buildx build of `agent-memory-graph:ci` (GHA layer cache), `smoke-docker.sh --live` on that exact image (hadolint from a pinned image, in-container hardening checks, Compose boot, `/health`, SIGTERM exit 0), then **Trivy**: fail closed on fixable `CRITICAL`/`HIGH` vulnerabilities and secrets (`--ignore-unfixed`, `exit-code: 1`), plus an informational report of unfixed findings |
+
+Run the same gates locally:
+
+```bash
+python scripts/audit-workflows.py && ruff check . && ruff format --check . && mypy \
+  && bandit -c pyproject.toml -r src && HYPOTHESIS_PROFILE=ci pytest \
+  && scripts/coverage-gate.sh && scripts/smoke-docker.sh --offline \
+  && scripts/audit-attribution.sh HEAD && scripts/audit-hygiene.sh && scripts/audit-cache-leaks.sh
+```
+
 ## Configuration
 
 Settings are read from `AMG_*` environment variables only; `.env` files are never loaded.
@@ -355,6 +379,9 @@ commands with `uv run`.
 | `commit-msg` | `.githooks/commit-msg`              | Conventional Commits subject, no tool-generated trailers, identity |
 | `pre-push`   | `.githooks/pre-push`                | Attribution audit of outgoing commits and a full-tree hygiene audit |
 
+| Workflows    | `scripts/audit-workflows.py`        | YAML syntax, actions pinned by full commit SHA with version comments, read-only permissions, `ubuntu-24.04`, no script injection, CI gate wiring |
+| Cache leaks  | `scripts/audit-cache-leaks.sh`      | No caches, virtualenvs or build/test artifacts outside `./.cache/` |
+
 All hook patterns are defined once in `.githooks/_policy.sh`. You can run the audits
 on demand with `scripts/audit-attribution.sh [<rev-list args>]` and
 `scripts/audit-hygiene.sh`.
@@ -374,7 +401,9 @@ tests/                    hermetic test suite (conftest scrubs service credentia
   unit/                   unit, API and property-based tests
   e2e/                    uvicorn subprocess harness (python -X dev, Unix socket)
 .githooks/                git hooks + shared policy
-scripts/                  audits, coverage gate, container policy + smoke tests
+scripts/                  audits (attribution, hygiene, workflows, cache leaks), coverage gate,
+                          container policy + smoke tests
+.github/workflows/ci.yml  CI: attribution audit, quality gates, container build, Trivy
 Dockerfile, .dockerignore, docker-compose.yml   hardened image and stack
 .envrc                    direnv: cache isolation under ./.cache/ and git wiring
 ```

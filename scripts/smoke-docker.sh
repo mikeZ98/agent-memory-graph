@@ -9,6 +9,7 @@
 #                                       probe /health, SIGTERM the API and assert exit 0
 #
 # Docker CLI state stays under ./.cache/docker (DOCKER_CONFIG), like every other cache.
+# CI builds the image itself and passes it in: SMOKE_IMAGE=<tag> SMOKE_SKIP_BUILD=1.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,7 +30,9 @@ case "${1:-}" in
     ;;
 esac
 
-readonly IMAGE="agent-memory-graph:smoke"
+readonly IMAGE="${SMOKE_IMAGE:-agent-memory-graph:smoke}"
+readonly SKIP_BUILD="${SMOKE_SKIP_BUILD:-0}"
+readonly COMPOSE_IMAGE="agent-memory-graph:local"
 readonly HADOLINT_IMAGE="hadolint/hadolint:v2.14.0@sha256:27086352fd5e1907ea2b934eb1023f217c5ae087992eb59fde121dce9c9ff21e"
 readonly PROJECT="amg-smoke"
 
@@ -62,8 +65,10 @@ step "policy (Dockerfile, .dockerignore, docker-compose.yml)"
 ok "container policy: non-root 10001:10001, digest pins, exec form, no package managers, read-only stack"
 
 step "hadolint"
-if command -v hadolint >/dev/null 2>&1; then
-  hadolint --failure-threshold warning Dockerfile || die "hadolint findings"
+HADOLINT="$(command -v hadolint || true)"
+[[ -z "$HADOLINT" && -x "$ROOT/.cache/bin/hadolint" ]] && HADOLINT="$ROOT/.cache/bin/hadolint"
+if [[ -n "$HADOLINT" ]]; then
+  "$HADOLINT" --failure-threshold warning Dockerfile || die "hadolint findings"
   ok "hadolint (local binary)"
 elif [[ "$MODE" != "offline" ]] && have_daemon; then
   docker run --rm -i --network none "$HADOLINT_IMAGE" hadolint --failure-threshold warning - <Dockerfile ||
@@ -102,9 +107,14 @@ if ! have_daemon; then
 fi
 
 step "build"
-docker build --pull=false -t "$IMAGE" --build-arg REVISION="$(git rev-parse --short HEAD)" . ||
-  die "image build failed"
-ok "built $IMAGE"
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "SMOKE_SKIP_BUILD=1 but $IMAGE does not exist"
+  ok "using prebuilt $IMAGE"
+else
+  docker build --pull=false -t "$IMAGE" --build-arg REVISION="$(git rev-parse --short HEAD)" . ||
+    die "image build failed"
+  ok "built $IMAGE"
+fi
 
 step "image metadata"
 user="$(docker image inspect -f '{{.Config.User}}' "$IMAGE")"
@@ -168,7 +178,9 @@ export AMG_HTTP_PORT="${AMG_HTTP_PORT:-18000}"
 cleanup() { docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-docker compose -p "$PROJECT" up -d --build --wait --wait-timeout 180 || {
+# Boot exactly the image verified above: tag it as the stack's image, never rebuild.
+docker tag "$IMAGE" "$COMPOSE_IMAGE"
+docker compose -p "$PROJECT" up -d --no-build --wait --wait-timeout 180 || {
   docker compose -p "$PROJECT" logs --tail 80
   die "stack did not become healthy"
 }
