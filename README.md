@@ -1,5 +1,12 @@
 # agent-memory-graph
 
+[![CI](https://github.com/mikeZ98/agent-memory-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/mikeZ98/agent-memory-graph/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+[![Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](pyproject.toml)
+[![mypy strict](https://img.shields.io/badge/types-mypy%20strict-blue.svg)](pyproject.toml)
+[![Network-free tests](https://img.shields.io/badge/network--free-pytest--socket-brightgreen.svg)](pyproject.toml)
+[![Committer mikeZ98](https://img.shields.io/badge/committer-mikeZ98-lightgrey.svg)](https://github.com/mikeZ98/agent-memory-graph/commits/main)
+
 **Asynchronous GraphRAG long-term memory for AI agents.** Conversations go in; a typed
 knowledge graph comes out. Entities and directed relations are stored in **Neo4j**, entity
 embeddings in **Qdrant**. A question is answered by seeding from vector similarity and
